@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "updated_at": "2025-01-01T00:00:00+00:00",
+  "contacts": [
+    {
+      "id": "+441234567890",
+      "displayName": "Example Contact",
+      "path": "+441234567890/",
+      "last_updated": "2025-01-01T00:00:00+00:00"
+    }
+  ],
+  "meAvatar": "_me/avatar.png"
+}

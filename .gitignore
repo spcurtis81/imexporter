@@ -1,0 +1,36 @@
+# macOS junk
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+
+# Logs & temp
+*.log
+*.out
+*.err
+
+# Virtual environments
+env/
+venv/
+.venv/
+
+# iCloud/Scriptable sync artifacts (don’t track actual user data!)
+/Social/
+/Library/
+/Documents/
+
+# VSCode / IDE
+.vscode/
+.idea/
+
+# Installer artifacts
+*.bak
+*.swp
