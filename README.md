@@ -98,5 +98,5 @@ See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for common issues.
 
 ## 📚 More Info
 
-- GitHub repository: _[placeholder link — fill after push]_  
+- GitHub repository: _[https://github.com/spcurtis81/imexporter]_  
 - Author: Stephen Curtis © 2025

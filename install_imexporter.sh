@@ -9,7 +9,7 @@
 # ────────────────────────────────────────────────────────────────────────────
 GH_OWNER="spcurtis81"
 GH_REPO="imexporter"
-VERSION="v1.0.1"          # <- bump this per release (self-pinned default)
+VERSION="v1.1.0"          # <- bump this per release (self-pinned default)
 
 # ────────────────────────────────────────────────────────────────────────────
 # Files to fetch from the tag (paths inside the repo)
