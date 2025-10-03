@@ -1,330 +1,221 @@
-#!/bin/zsh
-# install_imexporter.sh — “middle-ground” installer (raw tag URLs, self-pinned)
-# MIT © Stephen Curtis
+#!/usr/bin/env bash
+set -euo pipefail
 
-# ────────────────────────────────────────────────────────────────────────────
-# REPO + VERSION (self-pinned by default)
-# Bump VERSION when you cut a new release and re-upload this installer.
-# You can also override at runtime with --latest or --tag vX.Y.Z
-# ────────────────────────────────────────────────────────────────────────────
-GH_OWNER="spcurtis81"
-GH_REPO="imexporter"
-VERSION="v1.1.0"          # <- bump this per release (self-pinned default)
+# ============================================================
+#  iMessage Exporter (imexporter) — Installer
+#  Installs:
+#   • App files in ~/Library/Application Support/messages_export_v2
+#   • LaunchAgent (disabled by default)
+#   • iCloud data folders (…/Documents/Social/Messaging/iMessage)
+#   • Scriptable templates (into iCloud templates/)
+#   • Creates index.json and _me/ on first run
+# ============================================================
 
-# ────────────────────────────────────────────────────────────────────────────
-# Files to fetch from the tag (paths inside the repo)
-# ────────────────────────────────────────────────────────────────────────────
-ASSETS=(
-  "imexporter.py"                               # -> app dir
-  "scriptable/imessage_today.js"                # -> templates dir
-  "scriptable/imessage_trend.js"                # -> templates dir
-  "scriptable/imessage_stats.js"                # -> templates dir
-)
+# -------- config defaults (do not hard-code tag here) --------
+REPO="spcurtis81/imexporter"
+TAG=""
+APP_NS="messages_export_v2"
+APP_DIR="$HOME/Library/Application Support/${APP_NS}"
+LA_DIR="$HOME/Library/LaunchAgents"
+LA_PLIST="${LA_DIR}/com.ste.${APP_NS}.plist"
+RUNNER="${APP_DIR}/run_imexporter.sh"
+CLI="${APP_DIR}/imexporter.py"
 
-# Optional checksums file (JSON) at the tag root:
-# {
-#   "imexporter.py": "sha256hex...",
-#   "scriptable/imessage_today.js": "sha256hex...",
-#   ...
-# }
-CHECKSUMS_JSON="checksums.json"
+ICLOUD_BASE="$HOME/Library/Mobile Documents/com~apple~CloudDocs/Documents/Social/Messaging/iMessage"
+ICLOUD_TEMPLATES="${ICLOUD_BASE}/templates"
+ICLOUD_AVATARS="${ICLOUD_BASE}/avatars"
+ICLOUD_ME="${ICLOUD_BASE}/_me"
+ICLOUD_INDEX_JSON="${ICLOUD_BASE}/index.json"
 
-# ────────────────────────────────────────────────────────────────────────────
-# Target paths (macOS)
-# ────────────────────────────────────────────────────────────────────────────
-APP_DIR="$HOME/Library/Application Support/messages_export_v2"
-APP_PY="$APP_DIR/imexporter.py"
-RUNNER="$APP_DIR/run_imexporter.sh"
+# Scriptable template filenames in repo
+TEMPLATE_TODAY="scriptable/imessage_today_template.js"
+TEMPLATE_TREND="scriptable/imessage_trend_template.js"
+TEMPLATE_STATS="scriptable/imessage_stats_template.js"
 
-LOG_DIR="$HOME/Library/Logs"
-LOG_OUT="$LOG_DIR/messages_export_v2.out"
-LOG_ERR="$LOG_DIR/messages_export_v2.err"
+# -------------------- small helpers -------------------------
+cecho() { printf "%b\n" "$1"; }
+ok()    { cecho "  [OK]  $1"; }
+fail()  { cecho "  [FAIL] $1"; exit 1; }
+info()  { cecho "  [..]  $1"; }
+rule()  { cecho "============================================================"; }
 
-LAUNCH_PLIST="$HOME/Library/LaunchAgents/com.ste.messages_export_v2.plist"
+usage() {
+  cat <<EOF
+Usage: $0 --tag vX.Y.Z
 
-ICLOUD_ROOT="$HOME/Library/Mobile Documents/com~apple~CloudDocs"
-DATA_DIR="$ICLOUD_ROOT/Documents/Social/Messaging/iMessage"
+Options:
+  --tag   The Git tag/release to install from (required), e.g. v1.1.0
 
-SCRIPTABLE_DIR="$HOME/Library/Mobile Documents/iCloud~dk~simonbs~Scriptable/Documents/imessages"
-TEMPLATES_DIR="$SCRIPTABLE_DIR/templates"
-AVATARS_DIR="$SCRIPTABLE_DIR/avatars"
+Examples:
+  $0 --tag v1.1.0
+EOF
+}
 
-DESKTOP_SHORTCUT="$HOME/Desktop/iMessage Exporter.command"
-
-# Default Python candidates
-PY_CANDIDATES=(
-  "/opt/homebrew/bin/python3"
-  "/usr/local/bin/python3"
-  "/Library/Frameworks/Python.framework/Versions/3.*/bin/python3"
-  "/usr/bin/python3"
-)
-
-# ────────────────────────────────────────────────────────────────────────────
-# CLI args: --latest  |  --tag vX.Y.Z
-# ────────────────────────────────────────────────────────────────────────────
-USE_TAG="$VERSION"
-for arg in "$@"; do
-  case "$arg" in
-    --latest) USE_TAG="";;     # resolve via API
-    --tag)
-      echo "Use --tag with a value, e.g. --tag v1.2.3"
-      exit 2
-      ;;
-    --tag=*)
-      USE_TAG="${arg#--tag=}"
-      ;;
+# ---------------- parse args ----------------
+if [[ $# -lt 2 ]]; then usage; exit 1; fi
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --tag) TAG="$2"; shift 2;;
+    -h|--help) usage; exit 0;;
+    *) fail "Unknown argument: $1 (use --help)";;
   esac
 done
+[[ -z "${TAG}" ]] && fail "Please pass a Git tag, e.g. --tag v1.1.0"
 
-# ────────────────────────────────────────────────────────────────────────────
-# UI helpers
-# ────────────────────────────────────────────────────────────────────────────
-EM_OK="✅"; EM_FAIL="❌"; EM_STEP="•"
+RAW_BASE="https://raw.githubusercontent.com/${REPO}/${TAG}"
 
-step_start() { printf "%s %s " "$EM_STEP" "$1"; }
-step_ok()    { echo "[OK]"; }
-step_fail()  { echo "[FAIL: $1]"; }
-ask() {
-  local prompt="$1"; local def="$2"; local v=""
-  read "v?$prompt [$def]: "; echo "${v:-$def}"
+# ---------------- preflight -----------------
+rule
+cecho "iMessage Exporter (imexporter) — Installer"
+rule
+cecho "This will:"
+cecho "  • Create app & data folders (macOS + iCloud)"
+cecho "  • Let you choose a Python interpreter"
+cecho "  • Download the CLI and Scriptable templates from GitHub (pinned tag)"
+cecho "  • Write a LaunchAgent (disabled by default)"
+cecho "  • Print next steps, including Full Disk Access guidance"
+rule
+cecho "• Using pinned tag ${TAG}"
+
+command -v curl >/dev/null 2>&1 || fail "curl not found"
+ok "curl available"
+
+# -------------- ensure folders --------------
+info "Creating folders"
+mkdir -p "${APP_DIR}"             || fail "Cannot create ${APP_DIR}"
+mkdir -p "${LA_DIR}"              || fail "Cannot create ${LA_DIR}"
+mkdir -p "${ICLOUD_BASE}"         || fail "Cannot create ${ICLOUD_BASE}"
+mkdir -p "${ICLOUD_TEMPLATES}"    || fail "Cannot create ${ICLOUD_TEMPLATES}"
+mkdir -p "${ICLOUD_AVATARS}"      || fail "Cannot create ${ICLOUD_AVATARS}"
+mkdir -p "${ICLOUD_ME}"           || fail "Cannot create ${ICLOUD_ME}"
+ok "App, LaunchAgents, and iCloud folders created"
+
+# ----------- create index.json on first run ------------
+if [[ ! -f "${ICLOUD_INDEX_JSON}" ]]; then
+  info "Bootstrap index.json"
+  NOW="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  cat > "${ICLOUD_INDEX_JSON}" <<JSON
+{
+  "schema": 1,
+  "updated_at": "${NOW}",
+  "contacts": [],
+  "meAvatar": "_me/avatar.png"
 }
-
-run_or_report() {
-  local cmd="$1"
-  eval "$cmd" 2> /tmp/imexp.err
-  local rc=$?
-  if [[ $rc -ne 0 ]]; then
-    local reason="$(tr -d '\n' < /tmp/imexp.err | sed 's/^ *//;s/ *$//' )"
-    [[ -z "$reason" ]] && reason="error $rc"
-    step_fail "$reason"
-    return $rc
-  fi
-  step_ok; return 0
-}
-
-raw_url() {
-  local path="$1"
-  echo "https://raw.githubusercontent.com/${GH_OWNER}/${GH_REPO}/${USE_TAG}/${path}"
-}
-
-latest_tag() {
-  # Fast path (no jq dependency): grep the first "tag_name"
-  local api="https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/releases/latest"
-  local tag=$(curl -fsSL "$api" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
-  echo "$tag"
-}
-
-download() {
-  local url="$1" dest="$2"
-  curl -fsSL --retry 3 --retry-delay 1 "$url" -o "$dest"
-}
-
-calc_sha256() {
-  if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$1" | awk '{print $1}'
-  elif command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | awk '{print $1}'
-  else
-    echo ""
-  fi
-}
-
-# ────────────────────────────────────────────────────────────────────────────
-# Python selector
-# ────────────────────────────────────────────────────────────────────────────
-select_python() {
-  local found=()
-  for pat in "${PY_CANDIDATES[@]}"; do
-    for p in ${(f)"$(ls -1d $pat 2>/dev/null || true)"}; do
-      [[ -x "$p" ]] && found+=("$p")
-    done
-  done
-  local w="$(command -v python3 2>/dev/null || true)"
-  [[ -n "$w" && " ${found[*]} " != *" $w "* ]] && found+=("$w")
-
-  typeset -A uniq; local list=()
-  for p in "${found[@]}"; do [[ -n "$p" ]] && uniq["$p"]=1; done
-  for k in "${(@k)uniq}"; do list+=("$k"); done
-
-  if (( ${#list[@]} == 0 )); then echo "/usr/bin/python3"; return; fi
-
-  echo ""
-  echo "Available python3 interpreters:"
-  local i=1; for p in "${list[@]}"; do echo "  $i) $p"; ((i++)); done
-  local choice; read "choice?Select one (1-${#list[@]}) [1]: "; choice="${choice:-1}"
-  if ! [[ "$choice" =~ '^[0-9]+$' ]] || (( choice < 1 || choice > ${#list[@]} )); then choice=1; fi
-  echo "${list[$choice]}"
-}
-
-# ────────────────────────────────────────────────────────────────────────────
-# Banner
-# ────────────────────────────────────────────────────────────────────────────
-clear
-cat <<'BANNER'
-=====================================================
-  iMessage Exporter (imexporter) — Installer
-=====================================================
-This will:
- • Create app & data folders (macOS + iCloud)
- • Let you choose a Python interpreter
- • Download the CLI and Scriptable templates from GitHub (pinned tag)
- • Write a LaunchAgent (disabled by default—manage from the app)
- • Print next steps incl. Full Disk Access guidance
-BANNER
-echo ""
-
-# Resolve tag
-if [[ -z "$USE_TAG" ]]; then
-  step_start "Resolving latest release tag"
-  tag="$(latest_tag)"
-  if [[ -n "$tag" ]]; then USE_TAG="$tag"; step_ok
-  else step_fail "could not resolve latest tag"; exit 1; fi
+JSON
+  ok "index.json created"
 else
-  step_start "Using pinned tag"; echo "$USE_TAG [OK]"
+  ok "index.json already exists"
 fi
 
-# Preflight
-step_start "Preflight: curl"
-command -v curl >/dev/null 2>&1 && step_ok || { step_fail "curl not found"; exit 1; }
-
-step_start "Preflight: iCloud path"
-[[ -d "$ICLOUD_ROOT" ]] && step_ok || step_fail "Open Finder → iCloud Drive once (path not found)"
-
-# Create dirs
-step_start "Create app dir";       run_or_report "mkdir -p \"$APP_DIR\""
-step_start "Create log dir";       run_or_report "mkdir -p \"$LOG_DIR\""
-step_start "Create iCloud data";   run_or_report "mkdir -p \"$DATA_DIR\""
-step_start "Create templates dir"; run_or_report "mkdir -p \"$TEMPLATES_DIR\""
-step_start "Create avatars dir";   run_or_report "mkdir -p \"$AVATARS_DIR\""
-
-# Choose python
-PY_PATH="$(select_python)"
-step_start "Selected python: $PY_PATH"; step_ok
-
-# Fetch checksums.json (optional)
-CHECKSUMS=""
-step_start "Fetch checksums.json (optional)"
-cs_url="$(raw_url "$CHECKSUMS_JSON")"
-if CHECKSUMS="$(curl -fsSL "$cs_url" 2>/dev/null)"; then
-  step_ok
-else
-  step_fail "not found (skipping verification)"
+# --------------- discover pythons ----------------
+info "Scanning for python3 interpreters"
+declare -a PY_PATHS=()
+add_if_present() { [[ -x "$1" ]] && PY_PATHS+=("$1"); }
+add_if_present "/opt/homebrew/bin/python3"
+add_if_present "/usr/local/bin/python3"
+add_if_present "/usr/bin/python3"
+# fallback: anything on PATH
+if command -v python3 >/dev/null 2>&1; then
+  PATH_PY="$(command -v python3)"
+  [[ " ${PY_PATHS[*]} " == *" ${PATH_PY} "* ]] || PY_PATHS+=("${PATH_PY}")
 fi
 
-# Download assets
-for path in "${ASSETS[@]}"; do
-  fname="${path##*/}"
-  if [[ "$path" == scriptable/* ]]; then
-    dest="$TEMPLATES_DIR/$fname"
-  else
-    dest="$APP_DIR/$fname"
-  fi
-  step_start "Download $path"
-  if download "$(raw_url "$path")" "$dest"; then
-    # verify if we have checksum for this path
-    if [[ -n "$CHECKSUMS" ]]; then
-      expected="$(echo "$CHECKSUMS" | /usr/bin/python3 - <<'PY' "$path"
-import sys, json
-obj=json.loads(sys.stdin.read())
-key=sys.argv[1]
-print(obj.get(key,""))
-PY
-)"
-      if [[ -n "$expected" ]]; then
-        got="$(calc_sha256 "$dest")"
-        if [[ -n "$got" && "$got" == "$expected" ]]; then
-          step_ok
-        else
-          step_fail "checksum mismatch"
-        fi
-      else
-        step_ok
-      fi
-    else
-      step_ok
-    fi
-  else
-    step_fail "download failed"
-  fi
+if [[ ${#PY_PATHS[@]} -eq 0 ]]; then
+  fail "No python3 interpreters found. Install via: brew install python"
+fi
+
+cecho
+cecho "Available python3 interpreters:"
+for i in "${!PY_PATHS[@]}"; do
+  idx=$((i+1))
+  cecho "  ${idx}) ${PY_PATHS[$i]}"
 done
 
-# Runner & desktop shortcut
-step_start "Write runner"
-if cat > "$RUNNER" <<EOF
-#!/bin/zsh
-export PYTHONUNBUFFERED=1
-exec "$PY_PATH" "$APP_DIR/imexporter.py" "\$@"
-EOF
-then chmod +x "$RUNNER"; step_ok
-else step_fail "runner write failed"; fi
+read -rp "Select one (1-${#PY_PATHS[@]}) [1]: " SEL
+SEL="${SEL:-1}"
+if ! [[ "$SEL" =~ ^[0-9]+$ ]] || (( SEL < 1 || SEL > ${#PY_PATHS[@]} )); then
+  fail "Invalid selection."
+fi
+PYTHON="${PY_PATHS[$((SEL-1))]}"
+ok "Chosen python: ${PYTHON}"
 
-step_start "Write desktop shortcut"
-if cat > "$DESKTOP_SHORTCUT" <<EOF
-#!/bin/zsh
-cd "$APP_DIR"
-exec "$PY_PATH" "$APP_DIR/imexporter.py"
-EOF
-then chmod +x "$DESKTOP_SHORTCUT"; step_ok
-else step_fail "shortcut write failed"; fi
+# --------------- download helper ----------------
+download_checked() {
+  local url="$1" dest="$2" label="$3"
+  info "Downloading ${label}"
+  curl -fsSL "${url}" -o "${dest}" || fail "Download failed: ${label}"
+  # ensure non-empty
+  if [[ ! -s "${dest}" ]]; then
+    fail "Downloaded file is empty: ${label} (${dest})"
+  fi
+  ok "Downloaded ${label}"
+}
 
-# LaunchAgent (created but not loaded; managed in app)
-step_start "Write LaunchAgent plist"
-if cat > "$LAUNCH_PLIST" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key> <string>com.ste.messages_export_v2</string>
-  <key>StartInterval</key> <integer>1800</integer>
-  <key>ProgramArguments</key>
-  <array>
-    <string>$PY_PATH</string>
-    <string>$APP_DIR/imexporter.py</string>
-    <string>--auto-run</string>
-  </array>
-  <key>StandardOutPath</key> <string>$LOG_OUT</string>
-  <key>StandardErrorPath</key> <string>$LOG_ERR</string>
-  <key>KeepAlive</key> <true/>
-</dict>
-</plist>
-EOF
-then step_ok
-else step_fail "plist write failed"; fi
+# ------------------ fetch files ------------------
+download_checked "${RAW_BASE}/imexporter.py"                  "${CLI}"      "CLI app (imexporter.py)"
+download_checked "${RAW_BASE}/scripts/run_imexporter.sh"      "${RUNNER}"   "Runner script"
+download_checked "${RAW_BASE}/scripts/com.ste.${APP_NS}.plist" "${LA_PLIST}" "LaunchAgent plist"
 
-# Summary
-echo ""
-echo "====================================================="
-echo " Installation Summary"
-echo "====================================================="
-printf "%-16s %s\n" "Tag:" "$USE_TAG"
-printf "%-16s %s\n" "Python:" "$PY_PATH"
-printf "%-16s %s\n" "CLI:" "$APP_DIR/imexporter.py"
-printf "%-16s %s\n" "Runner:" "$RUNNER"
-printf "%-16s %s\n" "Shortcut:" "$DESKTOP_SHORTCUT"
-printf "%-16s %s\n" "LaunchAgent:" "$LAUNCH_PLIST"
-printf "%-16s %s\n" "Logs:" "$LOG_OUT , $LOG_ERR"
-printf "%-16s %s\n" "Data dir:" "$DATA_DIR"
-printf "%-16s %s\n" "Templates:" "$TEMPLATES_DIR"
-printf "%-16s %s\n" "Avatars:" "$AVATARS_DIR"
-echo ""
+chmod +x "${RUNNER}"
 
-cat <<'NEXT'
+# --------- scriptable templates to iCloud --------
+download_checked "${RAW_BASE}/${TEMPLATE_TODAY}" "${ICLOUD_TEMPLATES}/imessage_today_template.js" "Scriptable: Today template"
+download_checked "${RAW_BASE}/${TEMPLATE_TREND}" "${ICLOUD_TEMPLATES}/imessage_trend_template.js" "Scriptable: Trend template"
+download_checked "${RAW_BASE}/${TEMPLATE_STATS}" "${ICLOUD_TEMPLATES}/imessage_stats_template.js"  "Scriptable: Stats template"
+
+# --------------- write runner header ---------------
+# (ensure chosen python is used by the runner if the repo script is generic)
+if ! grep -q "${PYTHON}" "${RUNNER}" 2>/dev/null; then
+  # Prefix the runner with the selected interpreter if not already handled.
+  # We keep the original content after a marker.
+  TMP_RUN="${RUNNER}.tmp.$$"
+  {
+    echo "#!/usr/bin/env bash"
+    echo "set -euo pipefail"
+    echo "PYTHON=\"${PYTHON}\""
+    echo 'exec "$PYTHON" "'"${CLI}"'" "$@"'
+  } > "${TMP_RUN}"
+  chmod +x "${TMP_RUN}"
+  mv "${TMP_RUN}" "${RUNNER}"
+  ok "Runner updated to use: ${PYTHON}"
+fi
+
+# ---------------- summary ----------------
+cecho
+rule
+cecho "Installation Summary"
+rule
+printf "Tag:           %s\n" "${TAG}"
+printf "Python:        %s\n" "${PYTHON}"
+printf "CLI:           %s\n" "${CLI}"
+printf "Runner:        %s\n" "${RUNNER}"
+printf "LaunchAgent:   %s\n" "${LA_PLIST}"
+printf "iCloud base:   %s\n" "${ICLOUD_BASE}"
+printf "Templates:     %s\n" "${ICLOUD_TEMPLATES}"
+printf "Avatars:       %s\n" "${ICLOUD_AVATARS}"
+printf "Index JSON:    %s\n" "${ICLOUD_INDEX_JSON}"
+rule
+
+cat <<'TXT'
 Next steps:
-  1) Grant Full Disk Access in System Settings → Privacy & Security:
-       • Your Terminal
-       • /bin/zsh
-       • The Python you selected above
-  2) Double-click “iMessage Exporter.command” on your Desktop to open the app.
-  3) In the app, add your first contact and choose import scope (All / N days / None).
-  4) On iOS:
-       • Open Scriptable once to sync
-       • Create a File Bookmark named “MessagesStats” → iCloud/Documents/Social/Messaging/iMessage
-       • Add widgets using the templates
-  5) Use the app’s Settings → “Change run frequency” to enable the LaunchAgent.
-Tip: If you publish checksums.json at each tag, the installer will auto-verify.
-     Otherwise, it skips verification and still installs.
-NEXT
+  1) Grant "Full Disk Access" to your chosen Python and Terminal/iTerm
+     System Settings → Privacy & Security → Full Disk Access
+     Add: the Python path shown above, and your terminal app.
 
-echo ""
-echo "Done."
+  2) Run the CLI once to configure:
+       "$HOME/Library/Application Support/messages_export_v2/run_imexporter.sh" --menu
+
+  3) In Scriptable (iOS):
+       • Create a File Bookmark pointing to your iCloud folder:
+           Social/Messaging/iMessage
+       • Duplicate a template from iCloud/templates/ and replace the PHONE placeholder.
+       • Add the widget to your Home Screen and choose the new script.
+
+  4) (Optional) Enable the LaunchAgent after you’re happy:
+       launchctl load  -w "$HOME/Library/LaunchAgents/com.ste.messages_export_v2.plist"
+       launchctl start    com.ste.messages_export_v2
+     To disable:
+       launchctl unload -w "$HOME/Library/LaunchAgents/com.ste.messages_export_v2.plist"
+
+Done.
+TXT
