@@ -1,0 +1,28 @@
+❯ echo "===== old app dir ====="
+ls -la "$HOME/Library/Application Support/imexporter"
+
+echo
+echo "===== new v2 app dir ====="
+ls -la "$HOME/Library/Application Support/messages_export_v2" 2>/dev/null || echo "no messages_export_v2 dir"
+
+echo
+echo "===== v2 config.json ====="
+cat "$HOME/Library/Application Support/messages_export_v2/config.json" 2>/dev/null || echo "no config.json for v2"
+===== old app dir =====
+total 72
+drwxr-xr-x    4 stephencurtis  staff    128 Oct  4 09:04 .
+drwx------+ 208 stephencurtis  staff   6656 Dec 10 11:22 ..
+-rw-r--r--    1 stephencurtis  staff  29253 Oct  5 00:55 imexporter.py
+-rwxr-xr-x    1 stephencurtis  staff    339 Oct  5 00:55 run_imexporter.sh
+
+===== new v2 app dir =====
+total 8
+drwxr-xr-x    3 stephencurtis  staff    96 Oct  5 00:57 .
+drwx------+ 208 stephencurtis  staff  6656 Dec 10 11:22 ..
+-rw-r--r--    1 stephencurtis  staff    73 Oct  5 00:57 config.json
+
+===== v2 config.json =====
+{
+  "python_path": "/opt/homebrew/bin/python3",
+  "refresh_minutes": 30
+}%                                                                                         
