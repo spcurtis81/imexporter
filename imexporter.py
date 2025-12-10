@@ -7,7 +7,7 @@ MIT © Stephen Curtis
 What this app does
 ------------------
 • Exports iMessage DM history for selected contacts from the local Messages DB.
-• Writes per-contact files in iCloud so Scriptable widgets can consume them.
+• Writes per-contact files in iCloud so Scriptable widgets / dashboards can consume them.
 • Appends only NEW rows using a simple state file (no duplicates).
 • Builds per-day rollups: days[YYYY-MM-DD] => { me, them, total }.
 • Provides a simple CLI menu for: Run Export, Add New Number, Settings, Help.
@@ -33,11 +33,14 @@ from pathlib import Path
 # Constants / Paths
 # ─────────────────────────────────────────────────────────────────────────────
 HOME = Path.home()
-APP_DIR = HOME / "Library" / "Application Support" / "messages_export_v2"
-LOG_DIR = HOME / "Library" / "Logs"
-OUT_LOG = LOG_DIR / "messages_export_v2.out"
-ERR_LOG = LOG_DIR / "messages_export_v2.err"
 
+# App config + logs live locally (not in iCloud)
+APP_DIR = HOME / "Library" / "Application Support" / "imexporter"
+LOG_DIR = HOME / "Library" / "Logs"
+OUT_LOG = LOG_DIR / "imexporter.out"
+ERR_LOG = LOG_DIR / "imexporter.err"
+
+# Data lives in iCloud (unchanged – this is where your JSON lives now)
 ICLOUD_ROOT = HOME / "Library" / "Mobile Documents" / "com~apple~CloudDocs"
 DATA_ROOT = ICLOUD_ROOT / "Documents" / "Social" / "Messaging" / "iMessage"
 
@@ -45,10 +48,15 @@ INDEX_JSON = DATA_ROOT / "index.json"
 ME_AVATAR = DATA_ROOT / "_me" / "avatar.png"
 
 CONFIG_JSON = APP_DIR / "config.json"
-LAUNCH_PLIST = HOME / "Library" / "LaunchAgents" / "com.ste.messages_export_v2.plist"
+LAUNCH_PLIST = HOME / "Library" / "LaunchAgents" / "com.ste.imexporter.plist"
 
 SCRIPT_PATH = Path(__file__).resolve()
 PY_DEFAULT = shutil.which("python3") or "/usr/bin/python3"
+
+# Messages DB — this may differ on older macOS, but this works on Sonoma+.
+DB_PATHS = [
+    HOME / "Library" / "Messages" / "chat.db",
+]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI Banner
@@ -118,340 +126,321 @@ def day_key_from_iso(iso):
     # iso: "YYYY-MM-DDTHH:MM:SS+ZZ:ZZ"
     return (iso or "")[:10] if iso else None
 
-def safe_int(x, default=0):
-    try:
-        return int(x)
-    except Exception:
-        return default
-
-def print_last_run(contact_id, state):
-    last = state.get("last_run_at")
-    if last:
-        print_info(f"Last run for {contact_id}: {last}")
-    else:
-        print_info(f"Last run for {contact_id}: (first run)")
-
-def fda_hints():
-    print()
-    print_info("If you see 'unable to open database file', grant Full Disk Access to:")
-    print("   • Your Terminal")
-    print("   • /bin/zsh")
-    print("   • Your python3 (see Settings → Config Summary)")
-    print("System Settings → Privacy & Security → Full Disk Access")
-    print()
+def human_bytes(n):
+    for unit in ["B","KB","MB","GB","TB"]:
+        if n < 1024:
+            return f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}PB"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Index.json helpers
-# ─────────────────────────────────────────────────────────────────────────────
-def load_index():
-    if INDEX_JSON.exists():
-        try:
-            return json.loads(INDEX_JSON.read_text())
-        except Exception:
-            pass
-    return {
-        "schema": 1,
-        "updated_at": iso_now(),
-        "contacts": [],
-        "meAvatar": "_me/avatar.png"
-    }
-
-def save_index(idx):
-    idx["updated_at"] = iso_now()
-    INDEX_JSON.write_text(json.dumps(idx, indent=2))
-
-def ensure_contact_in_index(contact_id, display_name=None):
-    idx = load_index()
-    # Normalized folder name (we keep contact_id as folder)
-    folder = contact_id
-    exists = False
-    for c in idx["contacts"]:
-        if c.get("id") == contact_id:
-            exists = True
-            # Update name if provided
-            if display_name:
-                c["displayName"] = display_name
-            c["last_updated"] = iso_now()
-            break
-    if not exists:
-        idx["contacts"].append({
-            "id": contact_id,
-            "displayName": display_name or contact_id,
-            "path": f"{folder}/",
-            "last_updated": iso_now()
-        })
-    save_index(idx)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DB handling
+# Messages DB helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def find_messages_db():
-    """
-    Standard path:
-      ~/Library/Messages/chat.db
-    If not found, try candidate paths for newer OS migrations.
-    """
-    candidates = [
-        HOME / "Library" / "Messages" / "chat.db",
-        HOME / "Library" / "Group Containers" / "chatkit" / "Library" / "Messages" / "chat.db",  # rare
-    ]
-    for p in candidates:
+    for p in DB_PATHS:
         if p.exists():
             return p
-    return candidates[0]  # default, even if missing (so user sees path)
+    return None
 
-def open_db_readonly(db_path: Path):
-    uri = f"file:{db_path}?mode=ro"
-    return sqlite3.connect(uri, uri=True)
+def open_db():
+    db_path = find_messages_db()
+    if not db_path:
+        raise FileNotFoundError("Messages chat.db not found. Check Full Disk Access.")
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    return conn
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Export queries (DM-only)
-# ─────────────────────────────────────────────────────────────────────────────
-SQL_MESSAGES_FOR_HANDLE = """
-SELECT
-  m.ROWID            AS rowid,
-  m.date             AS date_apple,
-  m.is_from_me       AS is_from_me,
-  m.text             AS text,
-  m.handle_id        AS handle_id
-FROM message m
-JOIN handle h ON h.ROWID = m.handle_id
-WHERE h.id IN ({placeholders})
-ORDER BY m.ROWID ASC;
-"""
+def fetch_handle_ids_for_number(conn, number):
+    # Messages normalises phone numbers; we try both raw and E.164-ish
+    like_number = number.replace(" ", "")
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT ROWID, id
+        FROM handle
+        WHERE id LIKE ? OR id LIKE ?
+        """,
+        (f"%{like_number}", f"%{like_number.replace('+','')}"),
+    )
+    rows = cur.fetchall()
+    return [r["ROWID"] for r in rows]
 
-SQL_ATTACHMENTS_FOR_ROWID = """
-SELECT a.filename, a.mime_type
-FROM attachment a
-JOIN message_attachment_join maj ON maj.attachment_id = a.ROWID
-WHERE maj.message_id = ?
-"""
+def fetch_messages_for_handles(conn, handle_ids, since_rowid=None):
+    if not handle_ids:
+        return []
 
-def normalize_number_variants(num: str):
+    params = list(handle_ids)
+    handle_clause = ",".join("?" for _ in handle_ids)
+
+    where = f"m.handle_id IN ({handle_clause})"
+    if since_rowid is not None:
+        where += " AND m.ROWID > ?"
+        params.append(since_rowid)
+
+    sql = f"""
+    SELECT
+        m.ROWID as rowid,
+        m.date as date,
+        m.is_from_me as is_from_me,
+        m.text as text
+    FROM message m
+    WHERE {where}
+    ORDER BY m.ROWID ASC
     """
-    Build simple variants for the phone number, to improve matching in handle.id.
-    Assumes num is E.164 like +4479...
-    """
-    raw = num.strip()
-    variants = { raw }
-    # Add version without spaces/dashes
-    variants.add(raw.replace(" ", "").replace("-", ""))
-    # Local-only digits (strip + and leading zeros)
-    digits = "".join(ch for ch in raw if ch.isdigit())
-    if digits:
-        variants.add(digits)
-    return sorted(variants)
-
-def fetch_dm_rows(conn, number: str, min_rowid=None, since_days=None):
-    """
-    Fetch messages for a *specific handle* (DM-only).
-    We filter by handle.id variants and optionally by rowid/since_days.
-    """
-    # Build base query with placeholders for variants
-    variants = normalize_number_variants(number)
-    placeholders = ",".join(["?"] * len(variants))
-    sql = SQL_MESSAGES_FOR_HANDLE.format(placeholders=placeholders)
-
-    params = list(variants)
-
-    # We’ll post-filter by rowid and since date in Python (simplifies the SQL).
     cur = conn.cursor()
     cur.execute(sql, params)
-    rows = cur.fetchall()
-
-    # Convert and filter
-    out = []
-    cutoff_dt = None
-    if since_days is not None and since_days > 0:
-        cutoff_dt = datetime.now(timezone.utc) - timedelta(days=since_days)
-    for (rowid, date_apple, is_from_me, text, handle_id) in rows:
-        if min_rowid is not None and rowid <= min_rowid:
-            continue
-        iso = apple_time_to_iso(date_apple)
-        if cutoff_dt and iso:
-            try:
-                if datetime.fromisoformat(iso) < cutoff_dt:
-                    continue
-            except Exception:
-                pass
-        out.append({
-            "rowid": rowid,
-            "date": iso,
-            "is_from_me": int(is_from_me or 0),
-            "text": text or "",
-            "handle_id": handle_id
-        })
-    return out
-
-def fetch_attachments_for_row(conn, rowid):
-    cur = conn.cursor()
-    cur.execute(SQL_ATTACHMENTS_FOR_ROWID, (rowid,))
-    return [{"filename": r[0], "mime_type": r[1]} for r in cur.fetchall()]
+    return cur.fetchall()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Per-contact FS
+# Index / Contacts
 # ─────────────────────────────────────────────────────────────────────────────
-def contact_dir(contact_id: str) -> Path:
-    return DATA_ROOT / contact_id
+def load_index():
+    """
+    index.json lives in the iCloud data root and describes:
+    {
+      "contacts": [
+        {
+          "number": "+44....",
+          "label": "Friendly Name",
+          "enabled": true
+        },
+        ...
+      ]
+    }
+    """
+    if not INDEX_JSON.exists():
+        return {"contacts": []}
+    try:
+        return json.loads(INDEX_JSON.read_text())
+    except Exception:
+        return {"contacts": []}
 
-def ensure_contact_fs(contact_id: str):
-    d = contact_dir(contact_id)
+def save_index(idx):
+    DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    INDEX_JSON.write_text(json.dumps(idx, indent=2, ensure_ascii=False))
+
+def list_contacts():
+    idx = load_index()
+    return idx.get("contacts", [])
+
+def add_contact(number: str, label: str):
+    idx = load_index()
+    contacts = idx.get("contacts", [])
+    for c in contacts:
+        if c.get("number") == number:
+            c["label"] = label
+            c["enabled"] = True
+            break
+    else:
+        contacts.append({"number": number, "label": label, "enabled": True})
+    idx["contacts"] = contacts
+    save_index(idx)
+
+def disable_contact(number: str):
+    idx = load_index()
+    changed = False
+    for c in idx.get("contacts", []):
+        if c.get("number") == number:
+            c["enabled"] = False
+            changed = True
+    if changed:
+        save_index(idx)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-contact state
+# ─────────────────────────────────────────────────────────────────────────────
+def contact_dir(number: str) -> Path:
+    # Folder name = number exactly (e.g. "+4479...")
+    d = DATA_ROOT / number
     d.mkdir(parents=True, exist_ok=True)
     return d
 
-def paths_for_contact(contact_id: str):
-    d = ensure_contact_fs(contact_id)
-    safe_id = contact_id
-    csv_path  = d / f"messages_{safe_id}_dm.csv"
-    json_path = d / f"messages_{safe_id}_dm.json"
-    rollup    = d / "rollup.json"
-    state     = d / "state.json"
-    return d, csv_path, json_path, rollup, state
+def state_path(number: str) -> Path:
+    return contact_dir(number) / "state.json"
 
-def load_state(state_path: Path):
-    if state_path.exists():
-        try:
-            return json.loads(state_path.read_text())
-        except Exception:
-            pass
-    return {"last_rowid": 0, "last_run_at": None}
+def load_state(number: str):
+    p = state_path(number)
+    if not p.exists():
+        return {"last_rowid": None, "last_run": None}
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return {"last_rowid": None, "last_run": None}
 
-def save_state(state_path: Path, state):
-    state["last_run_at"] = iso_now()
-    state_path.write_text(json.dumps(state, indent=2))
+def save_state(number: str, state: dict):
+    p = state_path(number)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(p)
 
-def append_csv(csv_path: Path, rows):
-    new_file = not csv_path.exists()
-    with csv_path.open("a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        if new_file:
-            w.writerow(["rowid", "date", "is_from_me", "text", "attachments"])
-        for r in rows:
-            # Single-line text field (strip newlines)
-            txt = (r.get("text") or "").replace("\r"," ").replace("\n"," ").strip()
-            atts = r.get("attachments", [])
-            att_str = ";".join(a.get("filename","") or "" for a in atts)
-            w.writerow([r.get("rowid"), r.get("date"), r.get("is_from_me"), txt, att_str])
+# ─────────────────────────────────────────────────────────────────────────────
+# Export + rollup
+# ─────────────────────────────────────────────────────────────────────────────
+def export_for_contact(conn, number: str, label: str):
+    handles = fetch_handle_ids_for_number(conn, number)
+    if not handles:
+        print_fail(f"{number}: no matching handles in Messages DB")
+        return
 
-def append_json(json_path: Path, rows):
-    """
-    Keep an ever-growing JSON array (append new rows).
-    For large data sets this grows; fine for personal scale.
-    """
-    data = []
+    st = load_state(number)
+    last_rowid = st.get("last_rowid")
+
+    rows = fetch_messages_for_handles(conn, handles, since_rowid=last_rowid)
+    if not rows and last_rowid is not None:
+        # Nothing new, nothing to do
+        print_info(f"{number} ({label}): no new messages")
+        st["last_run"] = iso_now()
+        save_state(number, st)
+        return
+
+    # If first run (last_rowid is None), we export all rows
+    if not rows and last_rowid is None:
+        print_info(f"{number} ({label}): no messages found at all")
+        st["last_run"] = iso_now()
+        save_state(number, st)
+        return
+
+    # Build full data structure by merging existing + new
+    cdir = contact_dir(number)
+    json_path = cdir / f"messages_{number}_dm.json"
+    csv_path = cdir / f"messages_{number}_dm.csv"
+    rollup_path = cdir / "rollup.json"
+
+    existing = []
     if json_path.exists():
         try:
-            data = json.loads(json_path.read_text())
+            existing = json.loads(json_path.read_text())
         except Exception:
-            data = []
-    # Extend and write back
-    data.extend(rows)
-    json_path.write_text(json.dumps(data, indent=2))
+            existing = []
 
-def load_rollup(rollup_path: Path):
-    if rollup_path.exists():
-        try:
-            return json.loads(rollup_path.read_text())
-        except Exception:
-            pass
-    return {"days": {}, "updated_at": iso_now()}
+    # Convert DB rows to JSON records
+    new_records = []
+    max_rowid = last_rowid or 0
+    for r in rows:
+        rowid = r["rowid"]
+        if rowid > max_rowid:
+            max_rowid = rowid
+        iso_ts = apple_time_to_iso(r["date"])
+        new_records.append({
+            "rowid": rowid,
+            "date": iso_ts,
+            "is_from_me": bool(r["is_from_me"]),
+            "text": r["text"],
+        })
 
-def save_rollup(rollup_path: Path, roll):
-    roll["updated_at"] = iso_now()
-    rollup_path.write_text(json.dumps(roll, indent=2))
+    merged = existing + new_records
 
-def update_rollup(rollup_path: Path, new_rows):
-    roll = load_rollup(rollup_path)
-    days = roll.setdefault("days", {})
-    for r in new_rows:
-        dk = day_key_from_iso(r.get("date"))
+    # Atomic write JSON
+    tmp = json_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(merged, indent=2, ensure_ascii=False))
+    tmp.replace(json_path)
+
+    # CSV write
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["rowid", "date", "is_from_me", "text"])
+        for msg in merged:
+            w.writerow([
+                msg["rowid"],
+                msg["date"],
+                1 if msg["is_from_me"] else 0,
+                msg["text"] or "",
+            ])
+
+    # Build per-day rollups
+    days = {}
+    for msg in merged:
+        dk = day_key_from_iso(msg["date"])
         if not dk:
             continue
-        v = days.get(dk) or {"me": 0, "them": 0, "total": 0}
-        if r.get("is_from_me"):
-            v["me"] += 1
+        bucket = days.setdefault(dk, {"me": 0, "them": 0, "total": 0})
+        bucket["total"] += 1
+        if msg["is_from_me"]:
+            bucket["me"] += 1
         else:
-            v["them"] += 1
-        v["total"] = v.get("me", 0) + v.get("them", 0)
-        days[dk] = v
-    save_rollup(rollup_path, roll)
+            bucket["them"] += 1
+
+    tmp_r = rollup_path.with_suffix(".tmp")
+    tmp_r.write_text(json.dumps({"days": days}, indent=2, ensure_ascii=False))
+    tmp_r.replace(rollup_path)
+
+    st["last_rowid"] = max_rowid
+    st["last_run"] = iso_now()
+    save_state(number, st)
+
+    print_ok(f"{number} ({label}): exported {len(new_records)} new messages (total {len(merged)})")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Export logic
+# Logging redirection for CLI vs LaunchAgent
 # ─────────────────────────────────────────────────────────────────────────────
-def export_contact(conn, contact_id: str, import_scope: str = "incremental", days: int = None):
+def redirect_logs_if_needed():
     """
-    import_scope:
-      - "all"           : ignore state.rowid (but still append & state update)
-      - "last_n_days"   : only include messages within N days
-      - "none"          : do nothing (setup only)
-      - "incremental"   : default; only rowid > last_rowid
+    When run as LaunchAgent (auto-run), stdout/stderr are already redirected
+    by run_imexporter.sh, so we just use normal prints.
+
+    When run from Terminal, we want to write logs both to console and to the
+    log files; for simplicity we keep prints to console and rely on the shell
+    redirect for the agent.
     """
-    d, csv_path, json_path, rollup_path, state_path = paths_for_contact(contact_id)
-    state = load_state(state_path)
-    print_last_run(contact_id, state)
-
-    if import_scope == "none":
-        print_info(f"{contact_id}: setup only (no import)")
-        return 0
-
-    min_rowid = None
-    since_days = None
-
-    if import_scope == "all":
-        min_rowid = None
-        print_info("Initial import: all available messages currently on this Mac.")
-    elif import_scope == "last_n_days":
-        since_days = max(0, int(days or 0))
-        print_info(f"Initial import: last {since_days} day(s).")
-    else:
-        # incremental
-        min_rowid = safe_int(state.get("last_rowid"), 0)
-
-    # Fetch rows (DM-only)
-    rows = fetch_dm_rows(conn, contact_id, min_rowid=min_rowid, since_days=since_days)
-
-    # Attachments for each
-    enriched = []
-    for r in rows:
-        atts = fetch_attachments_for_row(conn, r["rowid"])
-        r["attachments"] = atts
-        enriched.append(r)
-
-    if not enriched:
-        print("Checked at {}: 0 new messages".format(datetime.now().replace(microsecond=0).isoformat()))
-        # Still update last_run time
-        save_state(state_path, state)
-        return 0
-
-    # Append to CSV & JSON
-    append_csv(csv_path, enriched)
-    append_json(json_path, enriched)
-
-    # Update rollup
-    update_rollup(rollup_path, enriched)
-
-    # Update state
-    max_rowid = max(r["rowid"] for r in enriched)
-    state["last_rowid"] = max(state.get("last_rowid", 0), max_rowid)
-    save_state(state_path, state)
-
-    print(f"Appended {len(enriched)} new messages")
-    print(f"   CSV   : {csv_path}")
-    print(f"   JSON  : {json_path}")
-    print(f"   ROLLUP: {rollup_path}")
-    print(f"   State : last_rowid={state['last_rowid']}")
-    return len(enriched)
+    # Nothing special here for now; kept for future extension.
+    ensure_dirs()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LaunchAgent
+# CLI menus
+# ─────────────────────────────────────────────────────────────────────────────
+def choose_contact_interactively():
+    contacts = list_contacts()
+    enabled = [c for c in contacts if c.get("enabled", True)]
+    if not enabled:
+        print("No contacts configured yet.")
+        return None
+
+    print()
+    print("Select contact:")
+    for i, c in enumerate(enabled, start=1):
+        print(f"{i}) {c['label']} ({c['number']})")
+    print("0) Cancel")
+    try:
+        choice = int(input("> ").strip() or "0")
+    except ValueError:
+        return None
+    if choice <= 0 or choice > len(enabled):
+        return None
+    return enabled[choice-1]
+
+def add_contact_menu():
+    print()
+    print("Add / Enable Contact")
+    print("--------------------")
+    number = input("Enter phone number (E.164, e.g. +4479...): ").strip()
+    if not number:
+        print("Cancelled.")
+        return
+    label = input("Display name: ").strip() or number
+    add_contact(number, label)
+    print_ok(f"Saved contact {label} ({number})")
+
+def list_contacts_menu():
+    contacts = list_contacts()
+    if not contacts:
+        print("No contacts configured.")
+        return
+    print()
+    print("Configured contacts:")
+    print("--------------------")
+    for c in contacts:
+        flag = "✅" if c.get("enabled", True) else "❌"
+        print(f"{flag} {c['label']} ({c['number']})")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LaunchAgent template & management
 # ─────────────────────────────────────────────────────────────────────────────
 PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key> <string>com.ste.messages_export_v2</string>
+  <key>Label</key> <string>com.ste.imexporter</string>
   <key>StartInterval</key> <integer>{interval}</integer>
   <key>ProgramArguments</key>
   <array>
@@ -479,11 +468,23 @@ def write_launch_agent(refresh_minutes: int, python_path: str):
     print_info(f"{LAUNCH_PLIST}")
 
 def reload_launch_agent():
-    label = "com.ste.messages_export_v2"
+    label = "com.ste.imexporter"
     # Try unload then load (ignore errors)
-    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(LAUNCH_PLIST)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(LAUNCH_PLIST)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(
+        ["launchctl", "bootout", f"gui/{os.getuid()}/{LAUNCH_PLIST}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(LAUNCH_PLIST)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     print_ok("Reloaded LaunchAgent")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -498,265 +499,153 @@ def settings_menu():
         print("1) Change run frequency (minutes)")
         print("2) Scan/select Python interpreter")
         print("3) Config Summary")
-        print("4) Back")
+        print("0) Back")
         choice = input("> ").strip()
         if choice == "1":
             try:
-                n = int(input("Enter minutes (>=1) [current {}]: ".format(cfg["refresh_minutes"])).strip() or cfg["refresh_minutes"])
-                cfg["refresh_minutes"] = max(1, n)
-                save_config(cfg)
-                write_launch_agent(cfg["refresh_minutes"], cfg["python_path"])
-                reload_launch_agent()
-            except Exception as e:
-                print_fail(f"Invalid value: {e}")
-        elif choice == "2":
-            pths = scan_pythons()
-            if not pths:
-                print_fail("No python3 interpreters found; keeping current.")
+                mins = int(input("Minutes between runs (min 1): ").strip())
+            except ValueError:
+                print_fail("Invalid number")
                 continue
-            for i,p in enumerate(pths,1):
-                print(f"  {i}) {p}")
-            pick = input("Select [1-{}] (Enter keeps current={}): ".format(len(pths), cfg["python_path"])).strip()
-            if pick:
-                try:
-                    idx = max(1, min(len(pths), int(pick))) - 1
-                    cfg["python_path"] = pths[idx]
-                    save_config(cfg)
-                    write_launch_agent(cfg["refresh_minutes"], cfg["python_path"])
-                    reload_launch_agent()
-                except Exception as e:
-                    print_fail(f"Selection error: {e}")
+            if mins < 1:
+                mins = 1
+            cfg["refresh_minutes"] = mins
+            save_config(cfg)
+            write_launch_agent(cfg["refresh_minutes"], cfg["python_path"])
+            reload_launch_agent()
+        elif choice == "2":
+            pick_python_menu(cfg)
         elif choice == "3":
-            config_summary()
-        elif choice == "4":
-            break
+            print()
+            print("Current config:")
+            print(json.dumps(cfg, indent=2))
+            print(f"App dir: {APP_DIR}")
+            print(f"Data root: {DATA_ROOT}")
+        elif choice == "0":
+            return
         else:
-            print("…")
+            print("Unknown option.")
 
 def scan_pythons():
-    candidates = [
+    candidates = []
+    # Common locations
+    for p in [
         "/opt/homebrew/bin/python3",
         "/usr/local/bin/python3",
-        "/Library/Frameworks/Python.framework/Versions/3.*/bin/python3",
         "/usr/bin/python3",
-    ]
-    found = []
-    for pat in candidates:
-        for p in sorted(Path("/").glob(pat.lstrip("/"))):
-            if os.access(p, os.X_OK):
-                found.append(str(p))
-    envp = shutil.which("python3")
-    if envp and envp not in found:
-        found.append(envp)
-    # Dedup
-    dedup = []
-    for p in found:
-        if p not in dedup:
-            dedup.append(p)
-    return dedup
+    ]:
+        if Path(p).exists():
+            candidates.append(p)
+    # Also scan PATH
+    which = shutil.which("python3")
+    if which and which not in candidates:
+        candidates.append(which)
+    return candidates
 
-def config_summary():
-    cfg = load_config()
+def pick_python_menu(cfg):
+    cands = scan_pythons()
+    if not cands:
+        print_fail("No python3 interpreters found. Install Python first.")
+        return
     print()
-    print("Config Summary")
-    print("--------------")
-    print(f"Python:          {cfg['python_path']}")
-    print(f"Refresh minutes: {cfg['refresh_minutes']}")
-    print(f"App dir:         {APP_DIR}")
-    print(f"Logs:            {OUT_LOG} / {ERR_LOG}")
-    print(f"Data root:       {DATA_ROOT}")
-    print(f"Index file:      {INDEX_JSON}")
-    # FDA hints
-    print()
-    print("Full Disk Access (recommended):")
-    print("  • Your Terminal")
-    print("  • /bin/zsh")
-    print(f"  • {cfg['python_path']}")
-    # List contacts
-    idx = load_index()
-    print()
-    print("Contacts:")
-    if not idx.get("contacts"):
-        print("  (none)")
-    else:
-        for c in idx["contacts"]:
-            print(f"  - {c.get('displayName','?')} [{c.get('id','?')}] -> {c.get('path')}")
+    print("Select python3 interpreter:")
+    for i, p in enumerate(cands, start=1):
+        print(f"{i}) {p}")
+    print("0) Cancel")
+    try:
+        choice = int(input("> ").strip() or "0")
+    except ValueError:
+        return
+    if choice <= 0 or choice > len(cands):
+        return
+    chosen = cands[choice-1]
+    cfg["python_path"] = chosen
+    save_config(cfg)
+    write_launch_agent(cfg["refresh_minutes"], cfg["python_path"])
+    reload_launch_agent()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Add new contact flow
+# Main export runner
 # ─────────────────────────────────────────────────────────────────────────────
-def add_new_number():
-    print()
-    print("Add New Number")
-    print("--------------")
-    print("Enter number in E.164 format (e.g. +447962786922).")
-    contact_id = input("Contact number: ").strip()
-    if not contact_id:
-        print_fail("No number entered")
-        return
-    display = input("Display name (optional): ").strip() or contact_id
-
-    # Create FS + index entry
-    ensure_contact_fs(contact_id)
-    ensure_contact_in_index(contact_id, display)
-
-    # Import scope
-    print()
-    print("Initial import scope:")
-    print("  1) All available on this Mac now")
-    print("  2) Last N days")
-    print("  3) None (setup only)")
-    sel = (input("> ").strip() or "1")
-    scope = "all"
-    days = None
-    if sel == "2":
-        scope = "last_n_days"
-        try:
-            days = int(input("Enter N days: ").strip())
-        except Exception:
-            days = 30
-    elif sel == "3":
-        scope = "none"
-
-    # Optional avatar hint
-    d = contact_dir(contact_id)
-    print()
-    print_info(f"You can drop an avatar here (optional): {d/'avatar.png'}")
-
-    # Run first import
-    dbp = find_messages_db()
-    try:
-        conn = open_db_readonly(dbp)
-    except Exception as e:
-        print_fail(f"DB open failed: {e}")
-        fda_hints()
-        return
-    try:
-        print()
-        print_info(f"Using DB: {dbp}")
-        export_contact(conn, contact_id, import_scope=scope, days=days)
-    finally:
-        conn.close()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Menu + auto-run
-# ─────────────────────────────────────────────────────────────────────────────
-def run_export_all():
-    idx = load_index()
-    contacts = [c.get("id") for c in idx.get("contacts", [])]
-    if not contacts:
-        print_info("No contacts configured yet.")
-        return
-
-    dbp = find_messages_db()
-    try:
-        conn = open_db_readonly(dbp)
-    except Exception as e:
-        print_fail(f"DB open failed: {e}")
-        fda_hints()
-        return
-
-    try:
-        print_info(f"Using DB: {dbp}")
-        total_new = 0
-        for cid in contacts:
-            print()
-            print_info(f"→ Exporting {cid}")
-            n = export_contact(conn, cid, import_scope="incremental")
-            total_new += n
-        print()
-        print_ok(f"Done. Total new messages this run: {total_new}")
-    finally:
-        conn.close()
-
-def help_placeholder():
-    print()
-    print("HELP — Coming soon")
-    print("Docs: GitHub README and wiki (to be linked).")
-
-def menu():
+def run_export(auto: bool = False):
     ensure_dirs()
-    cfg = load_config()
-    # Ensure index exists
-    if not INDEX_JSON.exists():
-        save_index(load_index())
+    idx = load_index()
+    contacts = [c for c in idx.get("contacts", []) if c.get("enabled", True)]
+    if not contacts:
+        print_info("No enabled contacts found in index.json. Nothing to export.")
+        return
 
-    # Initial setup checklist (visual)
-    print("Setup Checklist")
-    print("---------------")
-    print_ok(f"App dir: {APP_DIR}")
-    print_ok(f"Logs dir: {LOG_DIR}")
-    print_ok(f"Data root: {DATA_ROOT}")
-    print_ok(f"Index: {INDEX_JSON}")
-    print_ok(f"Python: {cfg['python_path']}")
-    print()
+    conn = open_db()
+    try:
+        total_new = 0
+        for c in contacts:
+            number = c.get("number")
+            label = c.get("label", number)
+            before_state = load_state(number)
+            before_rowid = before_state.get("last_rowid")
+            export_for_contact(conn, number, label)
+            after_state = load_state(number)
+            if after_state.get("last_rowid") and after_state.get("last_rowid") != before_rowid:
+                total_new += 1
+        print_info(f"Checked at {iso_now()}: {total_new} contacts had new messages")
+    finally:
+        conn.close()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Top-level CLI
+# ─────────────────────────────────────────────────────────────────────────────
+def main(argv=None):
+    argv = argv or sys.argv[1:]
+    ensure_dirs()
+    banner()
+
+    if "--auto-run" in argv:
+        # Launched by LaunchAgent
+        run_export(auto=True)
+        return 0
 
     while True:
         print("Main Menu")
         print("---------")
-        print("1) Run Export (all contacts)")
-        print("2) Add New Number")
-        print("3) Settings")
-        print("4) Help")
-        print("5) Exit")
+        print("1) Run Export Now")
+        print("2) Add / Enable Contact")
+        print("3) List Contacts")
+        print("4) Settings")
+        print("5) Help")
+        print("0) Quit")
         choice = input("> ").strip()
         if choice == "1":
-            # Show last run for each contact briefly
-            idx = load_index()
-            for c in idx.get("contacts", []):
-                cid = c.get("id")
-                state_path = paths_for_contact(cid)[-1]  # state.json
-                st = load_state(state_path)
-                print_last_run(cid, st)
-            print()
-            run_export_all()
+            run_export(auto=False)
         elif choice == "2":
-            add_new_number()
+            add_contact_menu()
         elif choice == "3":
-            settings_menu()
+            list_contacts_menu()
         elif choice == "4":
-            help_placeholder()
+            settings_menu()
         elif choice == "5":
-            break
+            print()
+            print("Help")
+            print("----")
+            print(textwrap.dedent("""
+                • Add contacts using option 2 (E.164 format, e.g. +4479...).
+                • Data is written under iCloud Drive:
+                    Documents/Social/Messaging/iMessage/
+                • Each contact gets:
+                    messages_<number>_dm.json
+                    messages_<number>_dm.csv
+                    rollup.json
+                    state.json
+                • Use Settings to choose Python and auto-run interval.
+                """).strip())
+        elif choice == "0":
+            return 0
         else:
-            print("…")
-        print()
-
-def auto_run():
-    """For LaunchAgent: just run export all, minimal chatter."""
-    ensure_dirs()
-    cfg = load_config()
-    idx = load_index()
-    contacts = [c.get("id") for c in idx.get("contacts", [])]
-    if not contacts:
-        return
-    dbp = find_messages_db()
-    try:
-        conn = open_db_readonly(dbp)
-    except Exception:
-        return
-    try:
-        total_new = 0
-        for cid in contacts:
-            n = export_contact(conn, cid, import_scope="incremental")
-            total_new += n
-        # Light line for logs
-        print(f"Checked at {datetime.now().replace(microsecond=0).isoformat()}: {total_new} new total")
-    finally:
-        conn.close()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Entry
-# ─────────────────────────────────────────────────────────────────────────────
-def main():
-    banner()
-    if "--auto-run" in sys.argv:
-        auto_run()
-        return
-    menu()
+            print("Unknown option.")
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except KeyboardInterrupt:
-        print("\n(Interrupted)")
+        print()
+        print("Interrupted by user.")
+        sys.exit(1)

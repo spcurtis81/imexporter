@@ -1,224 +1,236 @@
 #!/usr/bin/env bash
-# ============================================================================
-# iMessage Exporter (imexporter) — Installer
-# Portable (bash/zsh) – no 'mapfile', no bash-only traps.
-# ============================================================================
-
 set -euo pipefail
 
-APP_NAME="imexporter"
-ORG_ID="com.ste"                             # for LaunchAgent label
-GH_USER="spcurtis81"
-GH_REPO="imexporter"
+# ============================================================================
+# iMessage Exporter (imexporter) — Installer
+# Creates app folders (macOS + iCloud), lets you pick python3, installs CLI
+# and dashboard templates (from local repo if present, else from GitHub),
+# writes a LaunchAgent (disabled by default), and prints next steps.
+#
+# Usage:
+#   ./install_imexporter.sh [--tag v1.2.3]
+# ============================================================================
 
-# ---- Resolve key locations --------------------------------------------------
-HOME_DIR="${HOME}"
+# ---------- Config (change only if you fork/rename) -------------------------
+REPO_USER="spcurtis81"
+REPO_NAME="imexporter"
 
-APP_DIR="${HOME_DIR}/Library/Application Support/${APP_NAME}"
-LAUNCH_AGENTS_DIR="${HOME_DIR}/Library/LaunchAgents"
-LOG_OUT="${HOME_DIR}/Library/Logs/${APP_NAME}.out"
-LOG_ERR="${HOME_DIR}/Library/Logs/${APP_NAME}.err"
+APP_DIR="${HOME}/Library/Application Support/imexporter"
+LOG_DIR="${HOME}/Library/Logs"
+LAUNCH_AGENTS="${HOME}/Library/LaunchAgents"
+PLIST_PATH="${LAUNCH_AGENTS}/com.ste.imexporter.plist"
 
-ICLOUD_ROOT="${HOME_DIR}/Library/Mobile Documents/com~apple~CloudDocs/Documents"
-IMSG_BASE="${ICLOUD_ROOT}/Social/Messaging/iMessage"
-TEMPLATES_DIR="${IMSG_BASE}/templates"
-ME_DIR="${IMSG_BASE}/_me"
+# iCloud base + app paths
+ICLOUD_BASE="${HOME}/Library/Mobile Documents/com~apple~CloudDocs"
+ICLOUD_APP_DIR="${ICLOUD_BASE}/Documents/Social/Messaging/iMessage"
+ICLOUD_TEMPLATES_DIR="${ICLOUD_APP_DIR}/templates"
+ICLOUD_ME_DIR="${ICLOUD_APP_DIR}/_me"
+ICLOUD_INDEX_JSON="${ICLOUD_APP_DIR}/index.json"
 
-RUNNER_SH="${APP_DIR}/run_${APP_NAME}.sh"
-CLI_PY="${APP_DIR}/${APP_NAME}.py"
-PLIST="${LAUNCH_AGENTS_DIR}/${ORG_ID}.${APP_NAME}.plist"
-DESKTOP_SHORTCUT="${HOME_DIR}/Desktop/iMessage_Exporter.command"
+DESKTOP_SHORTCUT="${HOME}/Desktop/imexporter.sh"
 
-# ---- Pretty printing helpers ------------------------------------------------
-bold()  { printf "\033[1m%s\033[0m" "$*"; }
-green() { printf "\033[32m%s\033[0m" "$*"; }
-yellow(){ printf "\033[33m%s\033[0m" "$*"; }
-red()   { printf "\033[31m%s\033[0m" "$*"; }
+# ---------- Helpers ---------------------------------------------------------
+bold()  { printf "\033[1m%s\033[0m\n" "$*"; }
+green() { printf "\033[32m%s\033[0m\n" "$*"; }
+red()   { printf "\033[31m%s\033[0m\n" "$*"; }
 
-ok()    { printf "  %s %s\n" "$(green "[OK]")" "$*"; }
-info()  { printf "  %s %s\n" "$(yellow "[..]")" "$*"; }
-fail()  { printf "  %s %s\n" "$(red "[FAIL]")" "$*"; exit 1; }
-
-# ---- Parse args -------------------------------------------------------------
-TAG="${1:-}"
-if [[ "${TAG:-}" == "--tag" ]]; then
-  TAG="${2:-}"
-  shift 2 || true
-fi
-
-if [[ -z "${TAG:-}" ]]; then
-  echo "Usage: $0 --tag vX.Y.Z"
+die() {
+  red "ERROR: $*"
   exit 1
-fi
-
-echo "============================================================"
-echo "$(bold "iMessage Exporter (imexporter) — Installer")"
-echo "============================================================"
-echo "This will:"
-echo "  • Create app & data folders (macOS + iCloud)"
-echo "  • Let you choose a Python interpreter"
-echo "  • Download the CLI and Scriptable templates from GitHub (pinned tag)"
-echo "  • Write a LaunchAgent (disabled by default)"
-echo "  • Print next steps, including Full Disk Access guidance"
-echo "============================================================"
-
-echo "• Using pinned tag ${TAG}"
-
-# ---- Preflight --------------------------------------------------------------
-command -v curl >/dev/null 2>&1 || fail "curl not found"
-ok "curl available"
-
-# ---- Make folders -----------------------------------------------------------
-info "Creating folders"
-mkdir -p "${APP_DIR}" "${LAUNCH_AGENTS_DIR}" \
-         "${IMSG_BASE}" "${TEMPLATES_DIR}" "${ME_DIR}"
-: > "${LOG_OUT}"
-: > "${LOG_ERR}"
-ok "App, LaunchAgents, and iCloud folders created"
-
-# ---- Bootstrap index.json if missing ---------------------------------------
-info "Bootstrap index.json"
-INDEX_JSON="${IMSG_BASE}/index.json"
-if [[ ! -f "${INDEX_JSON}" ]]; then
-  NOW="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-  cat > "${INDEX_JSON}" <<JSON
-{
-  "schema": 1,
-  "updated_at": "${NOW}",
-  "contacts": [],
-  "meAvatar": "_me/avatar.png"
 }
-JSON
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+url_for() {
+  local path="$1"
+  local tag="${TAG:-}"
+  if [ -n "${tag}" ]; then
+    echo "https://raw.githubusercontent.com/${REPO_USER}/${REPO_NAME}/${tag}/${path}"
+  else
+    echo "https://raw.githubusercontent.com/${REPO_USER}/${REPO_NAME}/main/${path}"
+  fi
+}
+
+# ---------- Parse arguments -------------------------------------------------
+TAG=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --tag)
+      TAG="$2"
+      shift 2
+      ;;
+    --tag=*)
+      TAG="${1#*=}"
+      shift 1
+      ;;
+    *)
+      die "Unknown argument: $1"
+      ;;
+  esac
+done
+
+# ---------- Pre-flight checks ----------------------------------------------
+need curl
+need python3 || true  # we handle no-python case later
+
+echo "============================================================"
+bold "iMessage Exporter (imexporter) — Installer"
+echo "============================================================"
+echo
+
+# ---------- Create folders --------------------------------------------------
+echo "  [..]  Creating app folders"
+mkdir -p "${APP_DIR}" "${LAUNCH_AGENTS}" "${LOG_DIR}" \
+         "${ICLOUD_APP_DIR}" "${ICLOUD_TEMPLATES_DIR}" "${ICLOUD_ME_DIR}"
+echo "  [OK]  App, LaunchAgents, and iCloud folders created"
+
+CLI_DST="${APP_DIR}/imexporter.py"
+RUNNER_DST="${APP_DIR}/run_imexporter.sh"
+
+# ---------- Initial index.json ---------------------------------------------
+if [ ! -f "${ICLOUD_INDEX_JSON}" ]; then
+  echo "  [..]  Creating initial index.json"
+  cat > "${ICLOUD_INDEX_JSON}" <<EOF
+{
+  "contacts": []
+}
+EOF
+  echo "  [OK]  index.json created"
+else
+  echo "  [OK]  index.json exists"
 fi
-ok "index.json created"
 
-# ---- Find python interpreters (portable; prints list) ----------------------
-info "Scanning for python3 interpreters"
-# Collect unique python3 paths
+# Remove legacy root avatars folder if present (we no longer use it)
+if [ -d "${ICLOUD_APP_DIR}/avatars" ]; then
+  echo "  [OK]  removed legacy iMessage/avatars/ (no longer used)"
+  rm -rf "${ICLOUD_APP_DIR}/avatars" || true
+fi
+
+# ---------- Discover python3 interpreters (Bash 3.2 compatible) ------------
+echo "  [..]  Scanning for python3 interpreters"
 PY_LIST=()
-while IFS= read -r p; do
-  [[ -z "${p}" ]] && continue
-  # de-duplicate
-  already=0
-  for q in "${PY_LIST[@]}"; do [[ "$q" == "$p" ]] && already=1 && break; done
-  [[ $already -eq 0 ]] && PY_LIST+=("$p")
-done < <( command -v -a python3 2>/dev/null || true )
+if command -v python3 >/dev/null 2>&1; then
+  PY_LIST+=("$(command -v python3)")
+fi
+# Common Homebrew + system locations
+for p in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+  if [ -x "$p" ] && [[ ! " ${PY_LIST[*]} " =~ " $p " ]]; then
+    PY_LIST+=("$p")
+  fi
+done
 
-# Fallbacks
-[[ ${#PY_LIST[@]} -eq 0 && -x /opt/homebrew/bin/python3 ]] && PY_LIST+=("/opt/homebrew/bin/python3")
-[[ ${#PY_LIST[@]} -eq 0 && -x /usr/local/bin/python3   ]] && PY_LIST+=("/usr/local/bin/python3")
-[[ ${#PY_LIST[@]} -eq 0 && -x /usr/bin/python3         ]] && PY_LIST+=("/usr/bin/python3")
-
-if [[ ${#PY_LIST[@]} -eq 0 ]]; then
-  fail "No python3 interpreter found. Please install via Homebrew: brew install python"
+if [ "${#PY_LIST[@]}" -eq 0 ]; then
+  die "No python3 interpreters found. Install Python 3 via Homebrew or Xcode tools."
 fi
 
 echo "Available python3 interpreters:"
 i=1
-for p in "${PY_LIST[@]}"; do
-  echo "  $i) \"$p\""
+for py in "${PY_LIST[@]}"; do
+  echo "  $i) $py"
   i=$((i+1))
 done
 
-read -r -p "Select one (1–${#PY_LIST[@]}) [1]: " CHOICE
-CHOICE="${CHOICE:-1}"
-if ! [[ "${CHOICE}" =~ ^[0-9]+$ ]] || (( CHOICE < 1 || CHOICE > ${#PY_LIST[@]} )); then
-  fail "Invalid choice"
+read -r -p "Select python3 [1]: " choice
+choice="${choice:-1}"
+if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#PY_LIST[@]}" ]; then
+  die "Invalid selection."
 fi
-PYTHON="${PY_LIST[$((CHOICE-1))]}"
-ok "Using ${PYTHON}"
+PYTHON_BIN="${PY_LIST[$((choice-1))]}"
 
-# ---- Download helper (raw from GitHub tag) ---------------------------------
-download_raw () {
-  local rel_path="$1" dest="$2"
-  local url="https://raw.githubusercontent.com/${GH_USER}/${GH_REPO}/${TAG}/${rel_path}"
-  curl -fsSL "${url}" -o "${dest}" || fail "Download failed: ${url}"
-}
+echo "  [OK]  Using python3 at: $(green "${PYTHON_BIN}")"
 
-# ---- Download CLI & templates ----------------------------------------------
-info "Downloading CLI and templates from GitHub (${TAG})"
-download_raw "imexporter.py" "${CLI_PY}"
-chmod 0644 "${CLI_PY}"
-ok "CLI downloaded → ${CLI_PY}"
+# ---------- Install CLI & templates ----------------------------
+echo "  [..]  Installing CLI and templates"
 
-# Scriptable templates (placeholders are fine if you haven't pushed them yet)
-download_raw "templates/imessage_today.js"  "${TEMPLATES_DIR}/imessage_today.js"  || true
-download_raw "templates/imessage_trend.js"  "${TEMPLATES_DIR}/imessage_trend.js"  || true
-download_raw "templates/imessage_stats.js"  "${TEMPLATES_DIR}/imessage_stats.js"  || true
-ok "Templates placed in ${TEMPLATES_DIR}"
+if [ -f "./imexporter.py" ]; then
+  echo "  [OK]  Found local imexporter.py in current directory"
+  cp "./imexporter.py" "${CLI_DST}"
+  chmod +x "${CLI_DST}"
+  echo "  [OK]  Copied imexporter.py to ${CLI_DST}"
 
-# ---- Runner shell -----------------------------------------------------------
-cat > "${RUNNER_SH}" <<SH
+  # Templates from ./templates if present
+  for f in imessage_today.js imessage_trend.js imessage_stats.js; do
+    if [ -f "./templates/${f}" ]; then
+      cp "./templates/${f}" "${ICLOUD_TEMPLATES_DIR}/${f}"
+      echo "  [OK]  Installed templates/${f} from local templates/"
+    else
+      echo "  [WARN] templates/${f} not found locally; skipping"
+    fi
+  done
+else
+  echo "  [..]  No local imexporter.py found, downloading from GitHub ${TAG:+(}${TAG:-}(tag)${TAG:+)}"
+  # CLI from GitHub
+  CLI_URL="$(url_for 'imexporter.py')"
+  curl -fsSL "${CLI_URL}" -o "${CLI_DST}" || die "Download failed: ${CLI_URL}"
+  chmod +x "${CLI_DST}"
+
+  # Templates from GitHub (raw files in repo root /scriptable/)
+  for f in imessage_today.js imessage_trend.js imessage_stats.js; do
+    SRC_URL="$(url_for "scriptable/${f}")"
+    curl -fsSL "${SRC_URL}" -o "${ICLOUD_TEMPLATES_DIR}/${f}" || die "Download failed: ${SRC_URL}"
+  done
+fi
+
+echo "  [OK]  CLI & templates installed"
+
+# ---------- Runner shell for LaunchAgent & manual runs ---------------------
+cat > "${RUNNER_DST}" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-PY="${PYTHON}"
-CLI="${CLI_PY}"
-OUT="${LOG_OUT}"
-ERR="${LOG_ERR}"
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+PY="${PYTHON_BIN}"
+exec "\${PY}" "${CLI_DST}" --auto-run >> "${LOG_DIR}/imexporter.out" 2>> "${LOG_DIR}/imexporter.err"
+EOF
+chmod +x "${RUNNER_DST}"
 
-# pass through any args; default to --auto-run
-ARGS="\${*:-"--auto-run"}"
-
-"\${PY}" "\${CLI}" \${ARGS} >> "\${OUT}" 2>> "\${ERR}"
-SH
-chmod +x "${RUNNER_SH}"
-ok "Runner created → ${RUNNER_SH}"
-
-# ---- LaunchAgent (disabled by default) --------------------------------------
-cat > "${PLIST}" <<PL
+# ---------- LaunchAgent (disabled by default) ------------------------------
+cat > "${PLIST_PATH}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key>            <string>${ORG_ID}.${APP_NAME}</string>
+  <key>Label</key>            <string>com.ste.imexporter</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${RUNNER_SH}</string>
-    <string>--auto-run</string>
+    <string>${RUNNER_DST}</string>
   </array>
-
-  <!-- StartInterval is managed by the CLI settings menu; installer leaves it disabled. -->
-  <!-- <key>StartInterval</key> <integer>1800</integer> -->
-
-  <key>StandardOutPath</key>  <string>${LOG_OUT}</string>
-  <key>StandardErrorPath</key><string>${LOG_ERR}</string>
   <key>RunAtLoad</key>        <false/>
+  <key>StartInterval</key>    <integer>1800</integer>
+  <key>StandardOutPath</key>  <string>${LOG_DIR}/imexporter.out</string>
+  <key>StandardErrorPath</key><string>${LOG_DIR}/imexporter.err</string>
 </dict>
 </plist>
-PL
-ok "LaunchAgent written → ${PLIST}"
-echo "  (Not loaded; manage it from inside the app’s settings menu.)"
+EOF
 
-# ---- Optional desktop shortcut ---------------------------------------------
-cat > "${DESKTOP_SHORTCUT}" <<APP
+# ---------- Optional Desktop shortcut -------------------------------------
+cat > "${DESKTOP_SHORTCUT}" <<EOF
 #!/usr/bin/env bash
-osascript -e 'display dialog "iMessage Exporter: run ad-hoc export now?" buttons {"Cancel","Run"} default button "Run"' \
-  | grep -q "Run" && "${RUNNER_SH}" --run-now
-APP
-chmod +x "${DESKTOP_SHORTCUT}" || true
-ok "Desktop shortcut created (optional) → ${DESKTOP_SHORTCUT}"
+open -a Terminal "${RUNNER_DST}"
+EOF
+chmod +x "${DESKTOP_SHORTCUT}"
 
-# ---- Summary ---------------------------------------------------------------
+# ---------- Summary --------------------------------------------------------
 echo
 echo "============================================================"
-echo "$(bold "Installation Summary")"
+echo "$(bold 'Installation Summary')"
 echo "============================================================"
-echo "Tag:               ${TAG}"
-echo "Python:            ${PYTHON}"
-echo "CLI:               ${CLI_PY}"
-echo "Runner:            ${RUNNER_SH}"
-echo "LaunchAgent:       ${PLIST}"
-echo "Logs:              ${LOG_OUT} , ${LOG_ERR}"
-echo "Data dir:          ${IMSG_BASE}"
-echo "Templates:         ${TEMPLATES_DIR}"
-echo "Me (avatar) dir:   ${ME_DIR}"
+echo "Tag:            ${TAG:-local/main}"
+echo "Python:         ${PYTHON_BIN}"
+echo "CLI:            ${CLI_DST}"
+echo "Runner:         ${RUNNER_DST}"
+echo "LaunchAgent:    ${PLIST_PATH}"
+echo "Logs:           ${LOG_DIR}/imexporter.out , ${LOG_DIR}/imexporter.err"
+echo "Data dir:       ${ICLOUD_APP_DIR}"
+echo "Templates:      ${ICLOUD_TEMPLATES_DIR}"
+echo "Me (avatar) dir:${ICLOUD_ME_DIR}"
 echo
 echo "Next steps:"
-echo "  1) Give ${APP_NAME} Full Disk Access (System Settings → Privacy & Security)."
-echo "  2) Run the app once to configure:  ${green "${PYTHON} ${CLI_PY}"}"
-echo "  3) Inside the app:"
-echo "       • Add your first contact"
-echo "       • (Optional) enable/adjust schedule (LaunchAgent)"
-echo "       • Check config summary"
+echo "  1) Give imexporter Full Disk Access (System Settings → Privacy & Security)."
+echo "  2) Run the app once to configure:"
+echo "     $(green "\"${PYTHON_BIN}\" \"${CLI_DST}\"")"
+echo "  3) Use the app’s Settings menu to enable/disable the LaunchAgent and set frequency."
 echo
 echo "Done."
