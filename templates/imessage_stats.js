@@ -14,18 +14,16 @@
  *          avatar.png
  *        <CONTACT_ID>/
  *          rollup.json   ← this widget reads this file
- *          avatar.png    (not used in this widget, but available)
+ *          avatar.png
  *
  * Prerequisites
  *  • Scriptable (iOS)
  *  • Scriptable File Bookmark named "MessagesStats" that points to:
  *      iCloud Drive / Documents / Social / Messaging / iMessage
- *  • Set CFG.contactId to match the exported folder name (e.g. "+447962786922")
  *
  * Notes
- *  • No layout or style changes vs your previous working version.
- *  • Only the data-loading path has been updated to the new structure.
- *  • iOS controls widget refresh cadence; this script hints via refreshAfterDate.
+ *  • No layout/style changes vs your working version.
+ *  • Only data-loading is hardened (auto-contact + safe iCloud prefetch + better errors).
  *
  * © Stephen Curtis, 2025 — MIT (see repo)
  */
@@ -34,15 +32,14 @@
 // ║  CONFIGURATION                                                       ║
 // ╚══════════════════════════════════════════════════════════════════════╝
 const CFG = {
-  // ── New data location (per-contact folder) ───────────────────────────
-  bookmarkName: "MessagesStats",          // File Bookmark → .../Documents/Social/Messaging/iMessage
-  contactId: "<<PHONE_NUMBER>>",          // e.g. "+447962786922" (folder name under the bookmark)
+  bookmarkName: "MessagesStats", // File Bookmark → .../Documents/Social/Messaging/iMessage
 
-  // Keys inside each "days[date]" object in rollup.json
+  // If blank/placeholder, auto-select first enabled contact from index.json
+  contactId: "",                 // e.g. "+447962786922" (folder name under bookmark)
+
   meKey: "me",
   themKey: "them",
 
-  // Visual theme (unchanged)
   title: "iMessage Stats",
   bgGradient: { colors: ["#6F76E4", "#3E3A9E"], locations: [0, 1], angle: 135 },
 
@@ -51,40 +48,30 @@ const CFG = {
   subColor:   new Color("#FFFFFF", 0.80),
   divider:    new Color("#FFFFFF", 0.28),
 
-  // Outer padding around the whole widget content (top, left, bottom, right)
   padTop: 14, padLeft: 18, padRight: 18, padBottom: 12,
 
-  // Title font size
   titleSize: 16,
 
-  // Left column (Daily Avg + Record) font sizes
-  leftHeaderSize: 12,   // "Daily Avg"
-  leftBigSize: 38,      // big daily average number
-  recordHeaderSize: 11, // "Record"
-  recordValueSize: 22,  // record count number
+  leftHeaderSize: 12,
+  leftBigSize: 38,
+  recordHeaderSize: 11,
+  recordValueSize: 22,
 
-  // Right column (All Time table) font sizes
-  rightHeaderSize: 12,  // "All Time"
-  rightLabelSize: 14,   // "Ste", "Kate", "Total"
-  rightValueSize: 20,   // numbers
+  rightHeaderSize: 12,
+  rightLabelSize: 14,
+  rightValueSize: 20,
 
-  // Vertical spacing between table rows on the right
   rowGap: 6,
 
-  // Column layout (widths) — does NOT affect widget height
-  // columnMode: "percent" → left column takes leftPercent of inner width
-  //             "fixed"   → left column has fixed pixel width (leftFixedWidthPx)
   columnMode: "percent",
-  leftPercent: 0.50,         // proportion for left column when using "percent"
-  leftFixedWidthPx: null,    // exact px for left column when using "fixed"
-  gutterPx: 10,              // space between columns
+  leftPercent: 0.50,
+  leftFixedWidthPx: null,
+  gutterPx: 10,
 
-  // Footer (shows bottom-right within the right column)
   showUpdated: true,
   updatedPrefix: "Updated:",
   footerSize: 11,
 
-  // Background refresh hint for iOS (best-effort)
   refreshMinutes: 30,
 };
 
@@ -101,37 +88,90 @@ function fontWith(size, weight){
 }
 function fmtInt(n){ return Number(n||0).toLocaleString(); }
 
-/**
- * Resolve rollup.json path for the configured contactId via bookmark.
- */
-async function resolveRollupPath(){
+function isPlaceholderContactId(id){
+  if(!id) return true;
+  const s = String(id).trim();
+  return s === "" || s.includes("PHONE_NUMBER") || s.includes("<<") || s.includes(">>");
+}
+
+// ── iCloud root + index + contact resolution ───────────────────────────
+async function resolveRootAndIndex(){
   const fm = FileManager.iCloud();
   if (!fm.bookmarkExists(CFG.bookmarkName)){
     throw new Error(`Bookmark "${CFG.bookmarkName}" not found. (Scriptable → Settings → File Bookmarks)`);
   }
-  const root = fm.bookmarkedPath(CFG.bookmarkName); // …/Documents/Social/Messaging/iMessage
-  const contactDir = fm.joinPath(root, CFG.contactId);
-  const rollup = fm.joinPath(contactDir, "rollup.json");
-  return { fm, rollup };
+  const root = fm.bookmarkedPath(CFG.bookmarkName);
+  const indexPath = fm.joinPath(root, "index.json");
+
+  if(!fm.fileExists(indexPath)){
+    throw new Error(`index.json not found in bookmarked folder.\nBookmark points to:\n${root}`);
+  }
+
+  await fm.downloadFileFromiCloud(indexPath);
+  const raw = fm.readString(indexPath);
+  let index;
+  try { index = JSON.parse(raw); }
+  catch { throw new Error("index.json exists but is not valid JSON."); }
+
+  return { fm, root, indexPath, index };
 }
 
-/**
- * Load and parse rollup.json (downloads from iCloud if needed).
- */
-async function loadRollup(rollupPath, fm){
+function pickContactIdFromIndex(index){
+  const contacts = Array.isArray(index?.contacts) ? index.contacts : [];
+  const enabled = contacts.filter(c => c && (c.enabled === undefined || c.enabled === true));
+
+  // New schema: { number, label, enabled }
+  const c1 = enabled.find(c => c.number);
+  if (c1?.number) return c1.number;
+
+  // Old schema: { id, path, displayName, ... }
+  const c2 = enabled.find(c => c.id);
+  if (c2?.id) return c2.id;
+
+  return null;
+}
+
+function listLikelyContactFolders(fm, root){
+  try {
+    const items = fm.listContents(root) || [];
+    return items.filter(n => n && n.startsWith("+")).slice(0, 20);
+  } catch {
+    return [];
+  }
+}
+
+async function buildPathsForContact({ fm, root, contactId }){
+  const contactDir = fm.joinPath(root, contactId);
+  const rollupPath = fm.joinPath(contactDir, "rollup.json");
+  return { contactDir, rollupPath };
+}
+
+async function safeDownload(fm, path){
+  if(!fm.fileExists(path)) return false;
+  await fm.downloadFileFromiCloud(path);
+  return true;
+}
+
+async function prefetchIcloudFiles({ fm, indexPath, rollupPath }){
+  await safeDownload(fm, indexPath);
+  await safeDownload(fm, rollupPath);
+}
+
+async function loadRollup(rollupPath, fm, contactId, root){
+  if (!fm.fileExists(rollupPath)){
+    const options = listLikelyContactFolders(fm, root);
+    const hint = options.length ? `\n\nContact folders I can see:\n- ${options.join("\n- ")}` : "";
+    throw new Error(
+      `rollup.json not found for contact "${contactId}".\nExpected:\n${rollupPath}\n\nCheck CFG.contactId or ensure exporter has created rollup.json.${hint}`
+    );
+  }
   await fm.downloadFileFromiCloud(rollupPath);
-  if (!fm.fileExists(rollupPath)) throw new Error(`Rollup not found at: ${rollupPath}`);
   const raw = fm.readString(rollupPath);
   if (!raw) throw new Error("Rollup file is empty.");
   return { json: JSON.parse(raw), mtime: fm.modificationDate(rollupPath) };
 }
 
-/**
- * Compute lifetime statistics from the rollup:
- * - daily average across all days
- * - record daily total and its date
- * - lifetime sums for me, them, and total
- */
+// ── stats computation (unchanged) ──────────────────────────────────────
 function computeStats(json, meKey, themKey){
   const days = (json && json.days) || {};
   const entries = Object.entries(days);
@@ -163,7 +203,6 @@ function computeStats(json, meKey, themKey){
   };
 }
 
-/** Draw a 1-px hairline divider image. */
 function drawDividerImage(size, color){
   const ctx = new DrawContext();
   ctx.size = size; ctx.opaque = false; ctx.respectScreenScale = true;
@@ -172,13 +211,11 @@ function drawDividerImage(size, color){
   return ctx.getImage();
 }
 
-/** Estimate inner width (points) from device minus outer padding. */
 function estimateWidgetInnerWidth(){
   const screenPts = Device.screenSize().width / Device.screenScale();
   return Math.max(280, Math.min(screenPts - (CFG.padLeft + CFG.padRight), 640));
 }
 
-/** Decide left/right column widths from CFG without impacting height. */
 function computeColumnWidths() {
   const totalW = estimateWidgetInnerWidth();
   const gutter = Math.max(0, CFG.gutterPx);
@@ -201,14 +238,12 @@ function buildWidget(stats){
   const w = new ListWidget();
   w.setPadding(CFG.padTop, CFG.padLeft, CFG.padBottom, CFG.padRight);
 
-  // Background
   const grad = new LinearGradient();
   grad.colors = CFG.bgGradient.colors.map(c => new Color(c));
   grad.locations = CFG.bgGradient.locations;
   grad.angle = CFG.bgGradient.angle;
   w.backgroundGradient = grad;
 
-  // ── Title ────────────────────────────────────────────────────────────
   const titleRow = w.addStack(); titleRow.layoutHorizontally();
   const icon = titleRow.addImage(SFSymbol.named("tablecells").image);
   icon.imageSize = new Size(16,16); icon.tintColor = CFG.titleColor;
@@ -219,11 +254,10 @@ function buildWidget(stats){
 
   w.addSpacer(6);
 
-  // ── Columns (left: daily avg + record, right: totals) ────────────────
   const { leftW, rightW, gutter } = computeColumnWidths();
   const cols = w.addStack(); cols.layoutHorizontally();
 
-  // LEFT COLUMN
+  // LEFT
   const left = cols.addStack(); left.layoutVertically(); left.size = new Size(leftW, 0);
 
   const leftHdr = left.addText("Daily Avg");
@@ -253,10 +287,9 @@ function buildWidget(stats){
   recDate.textColor = CFG.subColor;
   recDate.lineLimit = 1; recDate.minimumScaleFactor = 0.8;
 
-  // GUTTER (space between columns)
   cols.addSpacer(gutter);
 
-  // RIGHT COLUMN
+  // RIGHT
   const right = cols.addStack(); right.layoutVertically(); right.size = new Size(rightW, 0);
 
   const rightHdr = right.addText("All Time");
@@ -283,7 +316,7 @@ function buildWidget(stats){
     right.addSpacer(CFG.rowGap);
   }
 
-  row("Ste",  stats.sumMe,  false);
+  row("Ste",  stats.sumMe,   false);
   row("Kate", stats.sumThem, false);
 
   const div = right.addStack(); div.layoutHorizontally();
@@ -293,19 +326,17 @@ function buildWidget(stats){
 
   row("Total", stats.sumTotal, true);
 
-  // Fill remaining vertical space, then bottom-right footer
   right.addSpacer();
 
   if (CFG.showUpdated){
     const footRow = right.addStack(); footRow.layoutHorizontally();
-    footRow.addSpacer(); // push to right edge
+    footRow.addSpacer();
     const foot = footRow.addText(`${CFG.updatedPrefix} ${stats.updatedAt}`);
     foot.font = Font.italicSystemFont(CFG.footerSize);
     foot.textColor = CFG.subColor;
     foot.lineLimit = 1; foot.minimumScaleFactor = 0.75;
   }
 
-  // Hint to iOS when to refresh next (best-effort)
   w.refreshAfterDate = new Date(Date.now() + CFG.refreshMinutes*60*1000);
   return w;
 }
@@ -315,21 +346,33 @@ function buildWidget(stats){
 // ╚══════════════════════════════════════════════════════════════════════╝
 async function run(){
   try{
-    const { fm, rollup } = await resolveRollupPath();
-    const { json } = await loadRollup(rollup, fm);
+    const { fm, root, indexPath, index } = await resolveRootAndIndex();
+
+    let contactId = CFG.contactId;
+    if (isPlaceholderContactId(contactId)) {
+      const picked = pickContactIdFromIndex(index);
+      if (!picked) throw new Error("No usable contacts found in index.json.");
+      contactId = picked;
+    }
+
+    const { rollupPath } = await buildPathsForContact({ fm, root, contactId });
+
+    // iCloud prefetch poke (safe)
+    await prefetchIcloudFiles({ fm, indexPath, rollupPath });
+
+    const { json } = await loadRollup(rollupPath, fm, contactId, root);
 
     const stats = computeStats(json, CFG.meKey, CFG.themKey);
     const w = buildWidget(stats);
     Script.setWidget(w);
     if (config.runsInApp) await w.presentMedium();
   } catch (err){
-    // Friendly error card
     const w = new ListWidget(); w.backgroundColor = new Color("#222");
     const t = w.addText(CFG.title || "iMessage Stats");
     t.textColor = Color.white(); t.font = Font.semiboldSystemFont(14);
     w.addSpacer(6);
     const e = w.addText(String(err));
-    e.textColor = Color.red(); e.minimumScaleFactor = 0.5;
+    e.textColor = Color.red(); e.minimumScaleFactor = 0.6; e.lineLimit = 6;
     Script.setWidget(w);
     if (config.runsInApp) await w.presentMedium();
   }

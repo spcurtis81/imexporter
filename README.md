@@ -6,62 +6,62 @@ Export iMessage DM history for specific contacts into tidy JSON/CSV files in iCl
 - Per-day rollups: `rollup.json`
 - Simple state file to avoid duplicates: `state.json`
 - Auto-run via LaunchAgent at a configurable interval
-- All data lives in iCloud Drive so your other tools can read it easily
+- All data lives in **iCloud Drive** so macOS, iOS, Scriptable, and other tools can read it
 
 ---
 
 ## 💡 What it does
 
-For each contact you configure:
+For each contact you configure, imexporter:
 
-- Reads the local `chat.db` Messages database on your Mac  
-- Finds all messages to/from that phone number (DMs only)  
+- Reads the local **Messages database** (`chat.db`) on your Mac  
+- Finds all direct (1-to-1) messages to/from that phone number  
 - Writes/updates files under:
 
-  ```
-  iCloud Drive
-    └ Documents
-      └ Social
-        └ Messaging
-          └ iMessage
-             ├ <+number>/
-             │  ├ messages_<number>_dm.json
-             │  ├ messages_<number>_dm.csv
-             │  ├ rollup.json
-             │  └ state.json
-             ├ index.json
-             ├ templates/
-             └ _me/
-  ```
+```
+iCloud Drive
+└─ Documents
+   └─ Social
+      └─ Messaging
+         └─ iMessage
+            ├─ <+number>/
+            │  ├ messages_<number>_dm.json
+            │  ├ messages_<number>_dm.csv
+            │  ├ rollup.json
+            │  └ state.json
+            ├─ index.json
+            ├─ templates/
+            └─ _me/
+```
 
-- The exporter only appends **new** messages after the last exported row, so it’s fast and avoids duplicates.
+- On each run, **only new messages** are appended using `state.json`
+- Daily totals are rebuilt into `rollup.json` for fast dashboards
 
-> ⚠️ This tool only works on **macOS**, and you must grant Full Disk Access to the Python interpreter so it can read `~/Library/Messages/chat.db`.
+> ⚠️ This tool only runs on **macOS**.  
+> You must grant **Full Disk Access** to Python so it can read `~/Library/Messages/chat.db`.
 
 ---
 
 ## 📦 Requirements
 
 - macOS (Ventura / Sonoma / Sequoia tested)
-- Python 3 (Homebrew or system)
+- Python 3 (Homebrew or system Python)
 - iCloud Drive enabled and signed in
-- A bit of terminal comfort
+- Basic comfort with Terminal
 
 ---
 
 ## 🚀 Installation
 
-You have two ways to install:
+### Install from GitHub
 
-### Option 1 — One-liner from GitHub (remote install)
-
-```
-curl -fsSL https://raw.githubusercontent.com/spcurtis81/imexporter/main/install_imexporter.sh   -o /tmp/install_imexporter.sh && chmod +x /tmp/install_imexporter.sh && /tmp/install_imexporter.sh
+```bash
+curl -fsSL https://raw.githubusercontent.com/spcurtis81/imexporter/main/install_imexporter.sh   -o /tmp/install_imexporter.sh   && chmod +x /tmp/install_imexporter.sh   && /tmp/install_imexporter.sh
 ```
 
-### Option 2 — From a local clone / ZIP of this repo
+### Install from local clone
 
-```
+```bash
 git clone https://github.com/spcurtis81/imexporter.git
 cd imexporter
 chmod +x install_imexporter.sh
@@ -70,78 +70,65 @@ chmod +x install_imexporter.sh
 
 ---
 
-## 🔐 Full Disk Access
+## 🔐 Full Disk Access (required)
 
-Grant Full Disk Access to:
+Grant **Full Disk Access** to:
 
-- your Python interpreter  
-- your terminal app
+- Your chosen Python interpreter (e.g. `/opt/homebrew/bin/python3`)
+- Your terminal app (Terminal, iTerm, etc.)
 
-`System Settings → Privacy & Security → Full Disk Access`
+Path:
+
+```
+System Settings → Privacy & Security → Full Disk Access
+```
 
 ---
 
 ## 🕹 First run & configuration
 
-Run the app once:
-
-```
+```bash
 /opt/homebrew/bin/python3 "$HOME/Library/Application Support/imexporter/imexporter.py"
 ```
 
-### 1. Add contacts  
-### 2. Run Export Now  
-### 3. Configure auto-run (LaunchAgent)
+Use the menu to:
+- Add / enable contacts
+- Run exports
+- Configure the LaunchAgent
 
-Check LaunchAgent status:
+---
+
+## 📁 iCloud data location
 
 ```
-launchctl list | grep com.ste.imexporter
-launchctl print gui/$(id -u)/com.ste.imexporter
+~/Library/Mobile Documents/com~apple~CloudDocs/
+Documents/Social/Messaging/iMessage/
 ```
 
 ---
 
-## 📁 Where the data lives
+## 📱 iOS & Scriptable widgets
 
-```
-~/Library/Mobile Documents/com~apple~CloudDocs/Documents/Social/Messaging/iMessage/
-```
+Scriptable widgets explicitly refresh iCloud files using
+`downloadFileFromiCloud()` to reduce stale data on iOS.
 
-Each contact folder contains:
-
-- `messages_<number>_dm.json`
-- `messages_<number>_dm.csv`
-- `rollup.json`
-- `state.json`
+Tapping a widget may briefly open Scriptable — this is an iOS limitation.
 
 ---
 
 ## 🧹 Uninstalling
 
-From the repo root:
-
-```
+```bash
 chmod +x uninstall_imexporter.sh
 ./uninstall_imexporter.sh
 ```
 
-Options:
-
-1. **Remove app only** (keeps iCloud data)
-2. **Remove app + iCloud data** (requires typing `DELETE`)
-0. Cancel
+Choose whether to:
+- Remove app only (recommended)
+- Remove app + iCloud data (destructive)
 
 ---
 
 ## 🧾 License
 
-MIT License.
-
----
-
-## 🐛 Issues
-
-Open issues at:
-
-https://github.com/spcurtis81/imexporter/issues
+MIT © Stephen Curtis

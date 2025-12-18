@@ -1,201 +1,196 @@
-Absolutely — here’s the complete, ready-to-commit README.md, fully restated and verified from top to bottom ✅
+# 📘 iMessage Exporter — User Guide
 
-⸻
+A lightweight, privacy-first macOS + iOS toolkit for exporting, analysing, and visualising your personal iMessage history using iCloud Drive and Scriptable widgets.
 
-📦 iMessage Exporter (imexporter)
+---
 
-A lightweight, privacy-friendly macOS + iOS toolkit for exporting, analysing, and visualising your personal iMessage history — right inside iCloud Drive and Scriptable widgets on your iPhone or iPad.
+## 🔍 What This Tool Does
 
-⸻
+**imexporter runs on your Mac** and reads your local iMessage database (`chat.db`).
+It **never uploads data anywhere** — everything stays on your devices.
 
-💡 What It Does
+It generates structured JSON and CSV files in **iCloud Drive**, which are then read by **Scriptable widgets** on iPhone or iPad to show:
 
-imexporter runs on your Mac and safely reads your local iMessage database (no external uploads).
-It generates clean, per-contact JSON files that sync automatically via iCloud Drive, where your Scriptable widgets can show:
-	•	📅 Daily message counts (today widget)
-	•	📈 Trends over time (history widget)
-	•	📊 Lifetime stats (totals, averages, records)
+- 📅 Messages today  
+- 📈 Message trends over time  
+- 📊 Lifetime stats (totals, averages, records)
 
-All of this runs locally — your data never leaves your devices.
+---
 
-⸻
+## 🧰 What You’ll Need
 
-🧰 What You’ll Need
+| Requirement | Purpose |
+|---|---|
+| macOS + Python 3 | Runs the exporter |
+| iCloud Drive | Syncs data to iOS |
+| iPhone / iPad | Displays widgets |
+| Scriptable app | Renders dashboards |
+| Terminal (basic) | Install & config |
 
-Requirement	Purpose
-macOS with Python 3	Runs the exporter CLI
-iCloud Drive enabled	Syncs the JSON output to iOS
-iPhone / iPad with Scriptable app	Displays widgets
-Terminal access (basic use)	To install and run the app
-GitHub access (optional)	To fetch updates manually
+---
 
+## ⚙️ Installing on macOS
 
-⸻
-
-⚙️ Installing on Mac
-
-Open Terminal and run:
-
+```bash
 curl -fsSL https://raw.githubusercontent.com/spcurtis81/imexporter/main/install_imexporter.sh \
   -o /tmp/install_imexporter.sh && \
 chmod +x /tmp/install_imexporter.sh && \
 /tmp/install_imexporter.sh
+```
 
-🧭 During installation
+### What the installer does
+- Creates:
+  - `~/Library/Application Support/imexporter`
+  - `~/Library/LaunchAgents/com.ste.imexporter.plist`
+- Creates iCloud data folder:
+  ```
+  iCloud Drive / Documents / Social / Messaging / iMessage
+  ```
+- Lets you choose a Python interpreter
+- Installs Scriptable widget templates
+- Prepares (but does **not** auto-enable) the LaunchAgent
 
-You’ll see:
-	•	A friendly banner and progress checklist
-	•	Automatic creation of folders in ~/Library/Application Support/imexporter
-	•	Creation of iCloud directories at
-iCloud Drive / Documents / Social / Messaging / iMessage
-	•	A scan for installed Python interpreters (you’ll choose one)
-	•	Download of the latest imexporter.py CLI and Scriptable templates
+---
 
-If any step fails, the installer clearly shows [FAILED: reason].
+## 🔐 Full Disk Access (REQUIRED)
 
-⸻
+Grant **Full Disk Access** to:
+- Your chosen Python interpreter (e.g. `/opt/homebrew/bin/python3`)
+- Your terminal app
 
-👥 Adding a Contact
+Path:
 
-After install, run:
+```
+System Settings → Privacy & Security → Full Disk Access
+```
 
-imexporter
+Without this, exports will silently fail.
 
-You’ll get a simple menu:
+---
 
-1. Run Export
-2. Add New Number
-3. Settings
-4. Help
-5. Exit
+## ▶️ First Run & Adding a Contact
 
-➕ Add your first contact
-	•	Choose option 2
-	•	Follow the on-screen instructions to enter a phone number
-	•	The app will ask if you want to:
-	•	Export all available messages
-	•	Export the last N days
-	•	Or just set up the structure (no export yet)
-	•	Once complete, you’ll see the contact appear in your iCloud folder.
+```bash
+/opt/homebrew/bin/python3 \
+"$HOME/Library/Application Support/imexporter/imexporter.py"
+```
 
-⸻
+Menu options:
+1. Run Export Now  
+2. Add / Enable Contact  
+3. List Contacts  
+4. Settings  
+5. Help  
 
-📁 Where Your Files Go
+### Adding a contact
+- Enter phone number in **E.164 format** (e.g. `+4479…`)
+- Choose a display name
+- The exporter creates the contact folder and `state.json`
 
-All data lives in iCloud Drive under:
+---
 
-Documents / Social / Messaging / iMessage
+## 📁 iCloud File Structure (Authoritative)
 
-Each contact has its own folder, for example:
+```
+iCloud Drive
+└─ Documents
+   └─ Social
+      └─ Messaging
+         └─ iMessage
+            ├─ index.json
+            ├─ _me/
+            │  └─ avatar.png
+            ├─ +447962786922/
+            │  ├ messages_+447962786922_dm.json
+            │  ├ messages_+447962786922_dm.csv
+            │  ├ rollup.json
+            │  └ state.json
+            └─ templates/
+```
 
-iMessage/
- ├── index.json             ← master list of contacts
- ├── _me/                   ← your own avatar and metadata
- │    └── avatar.png
- ├── +447962786922/
- │    ├── rollup.json       ← per-day message counts
- │    ├── trend_30d.json    ← cached trend data (optional)
- │    ├── meta.json         ← timestamps, stats
- │    └── avatar.png        ← contact’s image
- └── a94a8fe5d3.../
-      └── (another contact)
+Do not manually edit these files unless you know what you’re doing.
 
-The installer automatically creates this structure if it doesn’t exist.
+---
 
-⸻
+## 📱 iOS Widgets & Scriptable (IMPORTANT)
 
-🧩 Setting Up Widgets (on iOS)
-	1.	Install Scriptable from the App Store.
-	2.	Open Scriptable → Settings → File Bookmarks
-	•	Tap ➕
-	•	Browse to:
-iCloud Drive / Documents / Social / Messaging / iMessage
-	•	Name the bookmark: MessagesStats
-	3.	Copy the three widgets from your Mac (in scriptable/):
-	•	imessage_today.js
-	•	imessage_trend.js
-	•	imessage_stats.js
-	4.	Paste them into Scriptable (Files → Scriptable folder).
-	5.	Add a Medium widget to your home screen and assign one of the scripts.
+### File Bookmark (required)
 
-That’s it — your live data should appear within seconds!
+In Scriptable:
+1. Settings → File Bookmarks  
+2. Add a bookmark pointing to:
+   ```
+   iCloud Drive / Documents / Social / Messaging / iMessage
+   ```
+3. Name it **exactly**:
+   ```
+   MessagesStats
+   ```
 
-⸻
+### Widgets
+Scripts:
+- `imessage_today.js`
+- `imessage_trend.js`
+- `imessage_stats.js`
 
-🪞 Avatars
+Each widget:
+- Auto-detects the active contact from `index.json`
+- Calls `downloadFileFromiCloud()` before reading data (reduces stale iOS sync)
+- May briefly open Scriptable when tapped (iOS limitation)
 
-Each person can have a circular avatar image (PNG recommended).
-Store them here:
+This is expected.
 
-iCloud Drive / Documents / Social / Messaging / iMessage / <number> / avatar.png
+---
 
-Your own avatar lives in:
+## 🪞 Avatars (Optional)
 
-iCloud Drive / Documents / Social / Messaging / iMessage / _me / avatar.png
+- Your avatar:
+  ```
+  ... / iMessage / _me / avatar.png
+  ```
+- Contact avatar:
+  ```
+  ... / iMessage / <number> / avatar.png
+  ```
 
-If no avatar is found, the widgets draw a clean initials-based placeholder automatically.
+If missing, widgets fall back to initials.
 
-⸻
+---
 
-⚙️ Settings Menu
+## ⚙️ Settings Menu
 
-Run imexporter and choose option 3 (Settings) to:
-	•	Change update frequency (default 30 minutes)
-	•	Rescan Python interpreters
-	•	View a Config Summary, showing:
-	•	Python instance path
-	•	Full Disk Access (FDA) status for required services
-	•	Current refresh interval
-	•	Contact list and data locations
+From the CLI you can:
+- Enable / disable auto-run
+- Change refresh interval
+- List contacts and data paths
+- View configuration summary
 
-⸻
+---
 
-🔄 Updating the App
+## 🧹 Uninstalling
 
-You can safely update any time:
+```bash
+./uninstall_imexporter.sh
+```
 
-cd ~/Documents/Coding/Projects/imexporter
-git pull
+Choose:
+1. Remove app only (**recommended**)  
+2. Remove app + iCloud data (destructive)
 
-Then re-run the installer to ensure dependencies are aligned:
+You’ll be prompted before deletion.
 
-./install_imexporter.sh
+---
 
-This preserves your existing data and contacts.
+## 🧾 Troubleshooting
 
-⸻
+- Widgets stale → iOS iCloud delay (Scriptable forces refresh)
+- “File not found” → bookmark misnamed or wrong folder
+- Export runs but files unchanged → Full Disk Access missing
+- Duplicate contacts → legacy entries in `index.json`
 
-🧹 Uninstalling
+---
 
-If you ever want to remove imexporter completely:
+## 📬 Support
 
-# Remove app and data folders
-rm -rf ~/Library/Application\ Support/imexporter
-rm -f ~/Library/LaunchAgents/com.ste.imexporter.plist
-rm -f ~/Library/Logs/imexporter*.log
-
-# (Optional) Remove iCloud data
-rm -rf ~/Library/Mobile\ Documents/com~apple~CloudDocs/Documents/Social/Messaging/iMessage
-
-Your message database on your Mac remains untouched.
-
-⸻
-
-🧾 Need Help?
-	•	💬 GitHub: spcurtis81/imexporter
-	•	📧 Issues: please include the install log (from Terminal)
-	•	📘 Wiki: coming soon — will include sample widgets & screenshots
-
-⸻
-
-✅ You’re All Set!
-
-Your Mac now keeps your iMessage stats in sync automatically,
-and your iPhone widgets keep them beautifully visualised.
-
-Enjoy your new iMessage insights!
-
-⸻
-
-Would you like me to append a Troubleshooting appendix next (covering permissions, FDA, Scriptable setup, and widget sync issues)?
-It would appear right after the “Need Help?” section — ideal for first-time or non-technical users.
+GitHub: https://github.com/spcurtis81/imexporter  
+Issues: include macOS version + installer output
